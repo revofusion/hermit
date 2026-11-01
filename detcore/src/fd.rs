@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::Weak;
 use std::time::Duration;
 
 use nix::fcntl::OFlag;
@@ -503,6 +504,9 @@ struct SocketRights {
     /// (`Detcore::record_received_facts`). Never regained: a message sent
     /// without being queued may still be in flight however the queue looks.
     lockstep_lost: bool,
+    /// Native flock waits require every in-flight right to remain accounted.
+    /// Installed only for descriptor transfers under the event-driven policy.
+    flock_custody: Weak<crate::flock::Registry>,
     /// How many messages at the front of the queue a call may have taken
     /// without Detcore matching them, so that Linux may have released them
     /// already ([`DetFd::lose_lockstep_if_queued`]). Each such call takes one
@@ -528,6 +532,28 @@ struct SocketRights {
     /// either socket of the pair is passed to another table, which may hold
     /// it as an open file of its own (`DetFd::give_up_pair_completeness`).
     complete: bool,
+}
+
+impl SocketRights {
+    fn watch_flock_custody(&mut self, registry: &Arc<crate::flock::Registry>) {
+        if self.flock_custody.as_ptr() != Arc::as_ptr(registry) {
+            self.flock_custody = Arc::downgrade(registry);
+        }
+        if self.lockstep_lost || self.suspects != 0 {
+            registry.disable();
+        }
+    }
+
+    fn withdraw_flock_custody(&self) {
+        if let Some(registry) = self.flock_custody.upgrade() {
+            registry.disable();
+        }
+    }
+
+    fn lose_lockstep(&mut self) {
+        self.withdraw_flock_custody();
+        self.lockstep_lost = true;
+    }
 }
 
 /// Whether `received`, the identities of the descriptors one receive
@@ -674,6 +700,10 @@ fn give_up_completeness(rights: &mut SocketRights) {
 /// keep counting their copies in flight ([`InFlightOpenFile::into_queue_if_last`]).
 impl Drop for SocketRights {
     fn drop(&mut self) {
+        if self.queued.iter().any(|message| !message.descriptors.is_empty()) {
+            // Backend teardown is not an observed kernel release of the rights.
+            self.withdraw_flock_custody();
+        }
         let mut pending: Vec<QueuedMessage> = self.queued.drain(..).collect();
         while let Some(message) = pending.pop() {
             for sent in message.descriptors {
@@ -1032,6 +1062,16 @@ struct OpenFileDescription {
     /// trace mode is active.
     #[serde(default)]
     network_socket: NetworkSocketKind,
+    /// Creation provenance only; never inferred from SO_DOMAIN on an imported fd.
+    #[serde(default)]
+    socket_domain: Option<crate::event_driven_io::SocketDomain>,
+    #[serde(default)]
+    socket_pristine: bool,
+    #[serde(default)]
+    socket_probe_counter: u64,
+    /// Traced INET/INET6 UDP creation; not a readiness-source certificate.
+    #[serde(default)]
+    socket_udp: bool,
     /// True when this socket originated in `socketpair(2)`, selecting live
     /// internal routing. This does not prove guest-only readiness: an endpoint
     /// may be exported, or a datagram endpoint rebound. See
@@ -1118,6 +1158,9 @@ struct OpenFileDescription {
     /// written only after the kernel reports success.
     #[serde(default)]
     flock_mode: Option<i32>,
+    /// Native-only, shared with every alias of this open-file description.
+    #[serde(skip)]
+    flock_domain: Option<crate::flock::Reference>,
     /// Whether `flock_mode` describes the kernel state. Descriptors created by
     /// an intercepted syscall start known-unlocked; descriptors discovered
     /// after entering the guest can already carry a lock.
@@ -1672,6 +1715,10 @@ impl DetFd {
                 network_channel: false,
                 network_lowat: None,
                 network_socket: NetworkSocketKind::NotInet,
+                socket_domain: None,
+                socket_pristine: false,
+                socket_probe_counter: 0,
+                socket_udp: false,
                 socketpair_endpoint: false,
                 guest_peer: false,
                 accepted_connection: false,
@@ -1683,6 +1730,7 @@ impl DetFd {
                 exported: false,
                 receive_timeout: ReceiveTimeout::None,
                 flock_mode: None,
+                flock_domain: None,
                 flock_mode_known: true,
                 flock_mode_ever_known: true,
                 flock_ever_granted: false,
@@ -2880,6 +2928,44 @@ impl DetFd {
         self.with_description(|d| d.network_socket)
     }
 
+    pub(crate) fn socket_domain(&self) -> Option<crate::event_driven_io::SocketDomain> {
+        self.with_description(|d| d.socket_domain)
+    }
+
+    pub(crate) fn is_udp_socket(&self) -> bool {
+        self.with_description(|d| d.socket_udp)
+    }
+
+    pub(crate) fn set_udp_socket(&self) {
+        self.with_description(|d| d.socket_udp = true);
+    }
+
+    pub(crate) fn set_socket_domain(&self, domain: crate::event_driven_io::SocketDomain, pristine: bool) {
+        self.with_description(|d| {
+            d.socket_domain = Some(domain);
+            d.socket_pristine = pristine;
+        });
+    }
+
+    pub(crate) fn mark_socket_attached(&self) {
+        self.with_description(|d| d.socket_pristine = false);
+    }
+
+    pub(crate) fn begin_socket_probe(&self) -> Option<crate::event_driven_io::SocketProbe> {
+        self.with_description(|d| {
+            if !d.socket_pristine || d.exported
+                || d.socket_domain != Some(crate::event_driven_io::SocketDomain::Unix)
+            {
+                return None;
+            }
+            d.socket_probe_counter = d.socket_probe_counter.checked_add(1)?;
+            Some(crate::event_driven_io::SocketProbe {
+                file: d.id,
+                attempt: d.socket_probe_counter,
+            })
+        })
+    }
+
     /// Mark this open file as one end of a `socketpair(2)`. Like
     /// `set_netlink_route` this applies to the open file description, so a dup
     /// or fork alias of the same endpoint is covered too -- which is the case
@@ -2945,6 +3031,18 @@ impl DetFd {
         peer.with_description(|d| d.rights.complete = true);
     }
 
+    pub(crate) fn watch_flock_rights(&self, registry: &Arc<crate::flock::Registry>) {
+        let peer = self.with_description(|d| {
+            d.rights.watch_flock_custody(registry);
+            d.rights.peer.clone()
+        });
+        if let Some(peer) = peer {
+            peer.with_description(|d| d.rights.watch_flock_custody(registry));
+        } else {
+            registry.disable();
+        }
+    }
+
     /// Messages Detcore does not see sent may now reach this socket: a
     /// `bind` gave it a name, or it set `SO_PASSCRED`, which gives it one at
     /// its next send (`unix_autobind`). Its queue no longer holds every
@@ -3003,7 +3101,7 @@ impl DetFd {
     /// (`Detcore::settle_released_rights`).
     pub(crate) fn unpair_rights_peer(&self) -> Vec<SentDescriptor> {
         let (peer, purged) = self.with_description(|d| {
-            d.rights.lockstep_lost = true;
+            d.rights.lose_lockstep();
             d.rights.suspects = 0;
             d.rights.complete = false;
             (
@@ -3018,7 +3116,7 @@ impl DetFd {
         if let Some(peer) = peer {
             peer.with_description(|d| {
                 d.rights.peer = None;
-                d.rights.lockstep_lost = true;
+                d.rights.lose_lockstep();
                 give_up_completeness(&mut d.rights);
             });
         }
@@ -3103,7 +3201,7 @@ impl DetFd {
             }
             let dropped = (rights.queued.len() >= MAX_QUEUED_RIGHTS_MESSAGES)
                 .then(|| {
-                    rights.lockstep_lost = true;
+                    rights.lose_lockstep();
                     rights.suspects = rights.suspects.saturating_sub(1);
                     rights.queued.pop_front()
                 })
@@ -3136,7 +3234,7 @@ impl DetFd {
     pub(crate) fn lose_peer_lockstep(&self) {
         if let Some(peer) = self.with_description(|d| d.rights.peer.clone()) {
             peer.with_description(|d| {
-                d.rights.lockstep_lost = true;
+                d.rights.lose_lockstep();
                 give_up_completeness(&mut d.rights);
             });
         }
@@ -3160,6 +3258,9 @@ impl DetFd {
     pub(crate) fn lose_lockstep_if_queued(&self, taken: usize, legacy: bool) {
         self.with_description(|d| {
             let rights = &mut d.rights;
+            if taken != 0 && !rights.queued.is_empty() {
+                rights.withdraw_flock_custody();
+            }
             if rights.stream && !rights.queued.is_empty() {
                 // A stream read takes any number of messages of data alone
                 // before the one whose descriptors it detaches: the suspects
@@ -3168,14 +3269,14 @@ impl DetFd {
             }
             if !rights.queued.is_empty() {
                 if legacy {
-                    rights.lockstep_lost = true;
+                    rights.lose_lockstep();
                 }
                 rights.suspects = rights
                     .suspects
                     .saturating_add(taken)
                     .min(rights.queued.len());
             } else if rights.complete {
-                rights.lockstep_lost = true;
+                rights.lose_lockstep();
                 give_up_completeness(rights);
             }
         });
@@ -3210,7 +3311,7 @@ impl DetFd {
             match rights.queued.front() {
                 Some(head) if fits(head) => rights.queued.pop_front().map(|head| head.descriptors),
                 _ => {
-                    rights.lockstep_lost = true;
+                    rights.lose_lockstep();
                     give_up_completeness(rights);
                     None
                 }
@@ -3265,7 +3366,7 @@ impl DetFd {
                     Some(apply_stream_walk(rights, walk))
                 }
                 _ => {
-                    rights.lockstep_lost = true;
+                    rights.lose_lockstep();
                     give_up_completeness(rights);
                     None
                 }
@@ -3365,14 +3466,14 @@ impl DetFd {
                         });
                     }
                     _ => {
-                        rights.lockstep_lost = true;
+                        rights.lose_lockstep();
                         give_up_completeness(rights);
                     }
                 }
             }
             let Some(index) = rights.queued.iter().position(names) else {
                 if !legacy && !peek {
-                    rights.lockstep_lost = true;
+                    rights.lose_lockstep();
                     give_up_completeness(rights);
                 }
                 return None;
@@ -3406,7 +3507,7 @@ impl DetFd {
             let joinable = (place <= suspects && !ambiguous) || (peek && unique);
             if legacy {
                 if index > 0 {
-                    rights.lockstep_lost = true;
+                    rights.lose_lockstep();
                 }
             } else if place > suspects && !peek {
                 // Up to the match, every message stays, suspect. Where messages
@@ -3418,7 +3519,7 @@ impl DetFd {
                     rights.suspects = (index + 1).min(rights.queued.len());
                     give_up_completeness(rights);
                 }
-                rights.lockstep_lost = true;
+                rights.lose_lockstep();
                 return None;
             }
             let (sent, forgotten) = if peek {
@@ -3676,6 +3777,20 @@ impl DetFd {
     /// it.
     pub(crate) fn receive_timeout(&self) -> ReceiveTimeout {
         self.with_description(|d| d.receive_timeout)
+    }
+
+    pub(crate) fn flock_domain(&self) -> Option<Arc<crate::flock::Domain>> {
+        self.with_description(|description| {
+            description.flock_domain.as_ref().map(|reference| Arc::clone(&reference.0))
+        })
+    }
+
+    pub(crate) fn set_flock_domain(&self, domain: Arc<crate::flock::Domain>) {
+        self.with_description(|description| {
+            if description.flock_domain.is_none() {
+                description.flock_domain = Some(crate::flock::Reference(domain));
+            }
+        });
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -5918,5 +6033,50 @@ mod tests {
         drop(left);
         drop(right);
         assert!(sentinel.descriptor(3, false).is_none(), "and lets it go");
+    }
+
+    #[test]
+    fn unaccounted_rights_withdraw_flock_wait_authority() {
+        let owner = DetTid::from_raw(10);
+        for teardown in [false, true] {
+            let registry = Arc::new(crate::flock::Registry::default());
+            let domain = registry.domain((1, 60), OpenFileId::new(owner, 100));
+            let (left, right, sent) = pair_and_sent(owner, FdType::Regular);
+            left.watch_flock_rights(&registry);
+            queue_and_close(&left, sent, true);
+            assert!(domain.enabled());
+            if teardown {
+                drop(right);
+            } else {
+                right.lose_lockstep_if_queued(1, false);
+            }
+            assert!(!domain.enabled());
+            let mut changed = Vec::new();
+            assert!(registry.drain(&mut changed));
+            assert_eq!(changed, vec![domain.key]);
+        }
+    }
+
+    #[test]
+    fn rights_queue_capacity_withdraws_flock_wait_authority() {
+        let owner = DetTid::from_raw(10);
+        let registry = Arc::new(crate::flock::Registry::default());
+        let domain = registry.domain((1, 60), OpenFileId::new(owner, 100));
+        let (left, _right, sent) = pair_and_sent(owner, FdType::Regular);
+        left.watch_flock_rights(&registry);
+        queue_and_close(&left, sent, true);
+        for _ in 1..MAX_QUEUED_RIGHTS_MESSAGES {
+            left.queue_rights_to_peer(vec![SentDescriptor {
+                file: (1, 61), open_file: None, lock_copy: None,
+            }], 1).unwrap();
+        }
+        assert!(domain.enabled());
+        left.queue_rights_to_peer(vec![SentDescriptor {
+            file: (1, 61), open_file: None, lock_copy: None,
+        }], 1).unwrap();
+        assert!(!domain.enabled());
+        let mut changed = Vec::new();
+        assert!(registry.drain(&mut changed));
+        assert_eq!(changed, vec![domain.key]);
     }
 }

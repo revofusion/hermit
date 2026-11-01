@@ -1819,7 +1819,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// The owner Linux reports for the rendered file `path`
     /// ([`rendered_owner`]), for a per-process file from its task's lifecycle
-    /// in Detcore's process table: Detcore's virtual root while the task has
+    /// in Detcore's process table: its fixed guest identity while the task has
     /// its memory map, and global root once it has exited (a zombie, whose
     /// files Linux gives to global root) or is gone.
     pub(super) async fn rendered_file_owner<G: Guest<Self>>(
@@ -1828,8 +1828,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         path: &Path,
     ) -> Result<(u32, u32), Errno> {
         match self.rendered_task_state(guest, path).await {
-            Some((answer, true)) if !answer.without_mm => Ok((0, 0)),
+            Some((answer, true)) if !answer.without_mm => {
+                Ok((self.cfg.virtual_uid, self.cfg.virtual_gid))
+            }
             Some(_) => GuestProcfs::sysctl_owner(),
+            None if crate::procfs::rendered_path_is_per_process(path) => {
+                Ok((self.cfg.virtual_uid, self.cfg.virtual_gid))
+            }
             None => rendered_owner(path),
         }
     }
@@ -1896,11 +1901,23 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             path
         };
-        // A descriptor's fdinfo is a per-process file Detcore renders where
-        // the guest's procfs is not the kernel's (package K slice K8-h):
-        // classified so only there, so that every other backend's opens of
-        // one stay the kernel's, as before.
-        let classified = if self.renders_fdinfo() {
+        // Native fdinfo's legacy sanitizer hides every lock-bearing file.
+        // Managed flocks have exact OFD custody and a run-owned owner ledger,
+        // so use the existing structured renderer for those descriptors too.
+        let managed_flock = if self.cfg.event_driven_io
+            && self.cfg.backend == reverie::BackendCapabilities::PTRACE
+            && let Some(task) = crate::procfs::fdinfo_spelling_task(path)
+            && self.names_own_process_spelling(guest, task).await
+            && let Some(file) = ProcfsFile::rendered_fdinfo_at(path)
+            && let Some(fd) = file.rendered_fdinfo_target()
+        {
+            guest.thread_state().with_detfd(fd, |file| {
+                file.flock_domain().is_some_and(|domain| domain.enabled())
+            }).unwrap_or(false)
+        } else {
+            false
+        };
+        let classified = if self.renders_fdinfo() || managed_flock {
             if let Some(task) = crate::procfs::fdinfo_spelling_task(path)
                 && ProcfsFile::rendered_fdinfo_at(path).is_none()
                 && self.names_own_process_spelling(guest, task).await
@@ -7511,14 +7528,11 @@ mod tests {
         assert!(comm_read_is_trusted(true, false));
         assert!(comm_read_is_trusted(false, true));
         assert!(comm_read_is_trusted(false, false));
-        let substituted = crate::util::RawFd::open(
-            Path::new(&format!(
-                "/proc/{}/comm",
-                std::os::unix::process::parent_id()
-            )),
-            libc::O_RDONLY,
-        )
-        .unwrap();
+        // Any procfs comm can satisfy the filesystem check without proving
+        // whose comm it is. Use a task this test owns: its parent need not be
+        // visible in the current PID namespace.
+        let substituted =
+            crate::util::RawFd::open(Path::new("/proc/self/comm"), libc::O_RDONLY).unwrap();
         assert!(
             comm_file_is_on_procfs(&substituted),
             "a same-device substitution passes every file check"

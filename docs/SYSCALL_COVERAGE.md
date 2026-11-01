@@ -66,6 +66,16 @@ turns it off by default), its helper now runs, cannot attach to threads that
 are already traced, and LeakSanitizer reports that it does not work under
 ptrace, as under any tracer.
 
+### Post-Snapshot System V Shared Memory
+
+The historical counts and IPC roadmap below predate the run-local `shmget`,
+`shmat`, `shmdt`, and `shmctl` model. Native ptrace and KVM use real shared memfd
+backing with modeled identities, permissions and attachment lifetime rather
+than exposing the host SysV namespace. Semaphores, message queues, remapping,
+and partial replacement of attached mappings remain unsupported. See
+[Users.md](Users.md#system-v-shared-memory) for the supported operations and
+the bounded native PostgreSQL qualification; this does not qualify KVM hardware.
+
 ## Terminology And Scope
 
 - **Emulated** means Detcore returns a result without executing the guest's

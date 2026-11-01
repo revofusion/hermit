@@ -409,6 +409,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // copyout until the matching continuation really admits this task.
         let input_access = crate::reserved_input::BackgroundAccess::acquire(guest, run)?;
         crate::reserved_input::before_native_call(guest, run)?;
+        super::io::event_driven_external_attempt(guest, call).await;
         {
             let mut rsrcs = Resources::new(dettid);
             // With sequentialization enabled, only truly EXTERNAL endpoints reach here.
@@ -603,8 +604,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                 call.name()
             );
             // Otherwise, the socket was already nonblocking, so we can safely execute it just once.
-            self.record_or_replay_preserving_tool_errors(guest, wrapped)
-                .await
+            if !self.cfg.recordreplay_modes
+                && let Syscall::Connect(connect) = wrapped
+            {
+                let socket_probe = crate::event_driven_io::before_socket_attempt(guest, wrapped).await;
+                let result = Self::inject_connect_with_source_port(guest, connect).await;
+                crate::event_driven_io::after_socket_attempt(guest, wrapped, &result, socket_probe).await;
+                return result;
+            }
+            super::io::event_driven_send_attempt(guest, wrapped).await;
+            let result = self.record_or_replay_preserving_tool_errors(guest, wrapped).await;
+            crate::event_driven_io::after_fd_progress(guest, wrapped, &result).await;
+            result
         }
     }
 
@@ -1429,6 +1440,22 @@ pub fn ioaction_based_on_fd_status<
     call: C,
 ) -> Result<IOAction, Errno> {
     let wrapped: Syscall = call.into();
+    // MSG_DONTWAIT belongs to this operation, not to the open file description.
+    // Retrying its EAGAIN would turn a nonblocking send/receive into an
+    // unbounded wait even when every alias is logically blocking.
+    let flags = match wrapped {
+        Syscall::Sendto(call) => call.flags() as i32,
+        Syscall::Sendmsg(call) => call.flags(),
+        Syscall::Sendmmsg(call) => call.flags(),
+        Syscall::Recvfrom(call) => call.flags(),
+        Syscall::Recvmsg(call) => call.flags(),
+        Syscall::Recvmmsg(call) => call.flags() as i32,
+        _ => 0,
+    };
+    if flags & libc::MSG_DONTWAIT != 0 {
+        // The kernel still decides errors, partial transfers and packet lengths.
+        return Ok(IOAction::PassThru);
+    }
     let fd = get_fd(wrapped).unwrap_or_else(|| panic!("Failed to get fd for {}", call.name()));
     let (phys, virt, error_queue_never_waits) = guest.thread_state().with_detfd(fd, |detfd| {
         (
@@ -2821,6 +2848,33 @@ impl NonblockableSyscall for reverie::syscalls::Connect {
     }
 }
 
+#[async_trait]
+impl NonblockableSyscall for reverie::syscalls::Flock {
+    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+        self,
+        _guest: &mut G,
+    ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
+        (self.with_operation(self.operation() | libc::LOCK_NB), None)
+    }
+
+    fn syscall_would_have_blocked(&self, result: Result<i64, Errno>) -> bool {
+        result == Err(Errno::EWOULDBLOCK)
+    }
+}
+
+pub(crate) async fn retry_flock<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    guest: &mut G,
+    call: reverie::syscalls::Flock,
+    wait: crate::flock::Wait,
+) -> Result<i64, Error> {
+    let mut resources = Resources::new(guest.thread_state().dettid);
+    resources.insert(ResourceID::InternalIOPolling, Permission::W);
+    resources.fyi("flock");
+    retry_nonblocking_syscall_with_flock(
+        guest, call, resources, None, None, Some(Box::new(wait)),
+    ).await
+}
+
 /// Transform a syscall to nonblocking, then retry it until it returns a successful result.
 /// Retry a nonblockizable syscall (e.g. a pipe/socket read or write) until it succeeds.
 ///
@@ -3207,13 +3261,114 @@ where
     )
 }
 
+/// Opt-in observations only: never inject, advance logical time, or change a
+/// wait's result. Correlate begin/probe/end records in order within each dettid.
+fn trace_read_poll_wait<T, G>(
+    guest: &G,
+    call: Syscall,
+    phase: &str,
+    attempt: u32,
+    result: Option<&Result<i64, Error>>,
+    would_block: Option<bool>,
+) where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    if !tracing::enabled!(target: "detcore::wait_probe", tracing::Level::DEBUG) {
+        return;
+    }
+    let fd = match call {
+        Syscall::Read(call) => Some(call.fd()),
+        Syscall::Readv(call) => Some(call.fd()),
+        Syscall::Poll(_) => None,
+        _ => return,
+    };
+    let dettid = guest.thread_state().dettid;
+    tracing::debug!(
+        target: "detcore::wait_probe",
+        %dettid, wait = %call.number(), phase, attempt, ?result, ?would_block,
+        "wait"
+    );
+    if let Some(fd) = fd {
+        let descriptor = guest
+            .thread_state()
+            .with_detfd(fd, |entry| (entry.open_file_id(), entry.ty()));
+        tracing::debug!(
+            target: "detcore::wait_probe",
+            %dettid, phase, attempt, fd, ?descriptor, "read descriptor"
+        );
+    } else if let Syscall::Poll(call) = call {
+        // Bound diagnostic work for malformed or very large guest arrays.
+        // Explicitly report truncation rather than implying a complete snapshot.
+        let count = call.nfds().min(1024);
+        tracing::debug!(
+            target: "detcore::wait_probe",
+            %dettid, phase, attempt, nfds = call.nfds(),
+            timeout_ms = call.timeout(), truncated = call.nfds() > count,
+            "poll descriptors"
+        );
+        if phase == "end" {
+            return;
+        }
+        for index in 0..count {
+            let entry = call
+                .fds()
+                .and_then(|base| {
+                    base.as_raw()
+                        .checked_add(index as usize * std::mem::size_of::<syscalls::PollFd>())
+                })
+                .and_then(Addr::<syscalls::PollFd>::from_raw)
+                .ok_or(Errno::EFAULT)
+                .and_then(|address| guest.memory().read_value(address));
+            match entry {
+                Ok(entry) => {
+                    let descriptor = guest.thread_state().with_detfd(entry.fd, |fd| {
+                        (fd.open_file_id(), fd.ty())
+                    });
+                    tracing::debug!(
+                        target: "detcore::wait_probe",
+                        %dettid, phase, attempt, index, fd = entry.fd,
+                        events = ?entry.events, revents = ?entry.revents,
+                        ?descriptor, "poll descriptor"
+                    );
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        target: "detcore::wait_probe",
+                        %dettid, phase, attempt, index, ?error, "poll snapshot unavailable"
+                    );
+                    break;
+                }
+            }
+        }
+    }
+}
+
 // Private helper.
 async fn retry_nonblocking_syscall_helper<T, G, C>(
+    guest: &mut G,
+    call0: C,
+    rsrc: Resources,
+    maybe_timeout: Option<(LogicalTime, Result<i64, Errno>)>,
+    subtool: Option<&Detcore<T>>,
+) -> Result<i64, Error>
+where
+    C: NonblockableSyscall + Into<Syscall>,
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    retry_nonblocking_syscall_with_flock(
+        guest, call0, rsrc, maybe_timeout, subtool, None,
+    ).await
+}
+
+async fn retry_nonblocking_syscall_with_flock<T, G, C>(
     guest: &mut G,
     call0: C,
     mut rsrc: Resources,
     maybe_timeout: Option<(LogicalTime, Result<i64, Errno>)>,
     subtool: Option<&Detcore<T>>,
+    mut flock: Option<Box<crate::flock::Wait>>,
 ) -> Result<i64, Error>
 where
     C: NonblockableSyscall + Into<Syscall>,
@@ -3247,9 +3402,9 @@ where
     if rsrc.signal_interrupt_errno().is_none()
         && rsrc.resources.len() == 1
         && rsrc.resources.contains_key(&ResourceID::InternalIOPolling)
-        && call.signal_interrupt_errno() == Errno::ERESTARTSYS
+        && (call.signal_interrupt_errno() == Errno::ERESTARTSYS || guest.config().event_driven_io)
     {
-        rsrc.set_signal_interrupt_errno(Errno::ERESTARTSYS);
+        rsrc.set_signal_interrupt_errno(call.signal_interrupt_errno());
         // Where guest thread IDs are not host tasks (KVM) the scheduler keeps
         // every signal: the call has made no progress when it returns
         // ERESTARTSYS, and the backend restarts it unless a signal it would
@@ -3276,7 +3431,12 @@ where
     let mut turn_wait = checks_at_turn
         .then(|| KernelSignalWait::new(guest, 0, false, call.signal_interrupt_errno()));
     let mut published = PublishedWaitMask::default();
+    // A fallback stays on the physical path until this guest syscall ends.
+    // Rechecking an ineligible dependency graph on every internal retry adds
+    // RPCs to precisely the socket waits this policy cannot accelerate.
+    let mut observe_dependencies = guest.config().event_driven_io;
 
+    trace_read_poll_wait(guest, call0.into(), "begin", rsrc.poll_attempt, None, None);
     let result: Result<i64, Error> = loop {
         // A sibling can replace a descriptor while the previous request
         // waits. Classify the next attempt against the current table. The
@@ -3414,6 +3574,24 @@ where
             )
             .await;
         }
+        if observe_dependencies {
+            rsrc.io_dependencies = if let Some(wait) = flock.as_ref() {
+                match wait.observe(guest, rsrc.poll_attempt == 0).await {
+                    Ok(snapshot) => Some(snapshot),
+                    Err(error) => break Err(error),
+                }
+            } else {
+                crate::event_driven_io::observe(guest, call.into(), rsrc.poll_attempt).await
+            };
+            observe_dependencies = rsrc.io_dependencies.is_some();
+            if rsrc.io_dependencies.is_some() {
+                // Only a recorded thread-directed SIGCHLD may decide this
+                // wait, under the helper's saved mask and private-queue check.
+                // The scheduler wakes a registered dependency wait for that
+                // ledger entry; it does not commit or dequeue the signal.
+                rsrc.private_sigchld_decides = true;
+            }
+        }
         // A sibling may have replaced the destination descriptor while this
         // attempt waited for its turn. The per-attempt check above
         // (`passes_descriptors_out_now`) rechecks the channel immediately
@@ -3429,24 +3607,35 @@ where
         // Route through the record/replay subtool for internal pipes so each poll (an
         // EAGAIN, or the final data-bearing read) becomes one recorded event that replay
         // reproduces deterministically; otherwise execute the syscall directly.
-        let res = match subtool {
+        super::io::event_driven_send_attempt(guest, call.into()).await;
+        let res = if let Some(wait) = flock.as_mut() {
+            let Syscall::Flock(call) = call.into() else { unreachable!("flock wait on non-flock call") };
+            wait.attempt(guest, call.operation()).await
+        } else { match subtool {
             Some(detcore) => {
                 detcore
                     .record_or_replay_preserving_tool_errors(guest, call)
                     .await
             }
             None => {
-                // The preceding placeholder inspection can await. Publish
-                // persistent/reference effects at the actual issue cut,
-                // not from the descriptor or ancillary view before it.
-                match crate::reserved_input::before_native_call(guest, call.into()) {
-                    Ok(()) => guest.inject_with_retry(call).await.map_err(Error::from),
+                let socket_probe = crate::event_driven_io::before_socket_attempt(guest, call.into()).await;
+                // Publish persistent/reference effects at the actual issue cut,
+                // after placeholder inspection and readiness observations.
+                let result = match crate::reserved_input::before_native_call(guest, call.into()) {
+                    Ok(()) => match call.into() {
+                        Syscall::Connect(connect) => {
+                            Detcore::<T>::inject_connect_with_source_port(guest, connect).await
+                        }
+                        _ => guest.inject_with_retry(call).await.map_err(Error::from),
+                    },
                     // Keep the normal EntryImport restoration below even
                     // when native issue is refused before it begins.
                     Err(error) => Err(error),
-                }
+                };
+                crate::event_driven_io::after_socket_attempt(guest, call.into(), &result, socket_probe).await;
+                result
             }
-        };
+        }};
         if let Err(error) = put_back_entry_import(guest, &entry_import, displaced, res.is_ok()) {
             break Err(error);
         }
@@ -3462,6 +3651,17 @@ where
             Err(Error::Errno(error)) => Err(error),
             Err(error) => break Err(error),
         };
+        crate::event_driven_io::after_fd_progress(
+            guest, call.into(), &syscall_result.map_err(Error::from),
+        ).await;
+        trace_read_poll_wait(
+            guest,
+            call0.into(),
+            "probe",
+            rsrc.poll_attempt,
+            Some(&syscall_result.map_err(Error::from)),
+            Some(call.syscall_would_have_blocked(syscall_result)),
+        );
         // Before the signal check: Linux looks for a pending signal only when
         // the call must wait, and a receive on a socket shut down for reading
         // does not. Record and replay poll a receive here only on a
@@ -3557,6 +3757,9 @@ where
     let entry_import =
         EntryImport::with_observation(entry_import, call0.into(), completed_observation);
     keep_entry_view(guest, entry_import);
+    trace_read_poll_wait(
+        guest, call0.into(), "end", rsrc.poll_attempt, Some(&result), None,
+    );
 
     // The single exit: the guest's mask goes back before the result is
     // returned. A mask `block_in_place` installed goes back through
@@ -4745,6 +4948,13 @@ where
     let mut deliver_under_wait_mask = false;
     let mut published = PublishedWaitMask::default();
     publish_wait_mask(guest, signals.effective_mask(), &mut published).await;
+    // Only this concrete syscall with no guest temporary mask may publish
+    // private-guard provenance. A matching FYI string alone grants nothing.
+    let native_epoll_guard = guest.config().backend == reverie::BackendCapabilities::PTRACE
+        && publishes_guest_masks(guest.config())
+        && matches!(call0.into(), Syscall::EpollWait(_))
+        && wait_mask.is_none();
+    let mut epoll_guard_published = false;
     rsrc.poll_deadline = poll_deadline_for(guest, maybe_timeout.map(|(deadline, _)| deadline));
     let (mut call, mut guard) = call0.into_nonblocking(guest).await;
     let mut first_turn = true;
@@ -4752,8 +4962,16 @@ where
     // wait: the turn's probe runs first, and the wait ends with the restart
     // errno only if the call has nothing to report.
     let mut interrupt_after_probe;
+    let mut observe_dependencies = guest.config().event_driven_io && wait_mask.is_none();
+    trace_read_poll_wait(guest, call0.into(), "begin", rsrc.poll_attempt, None, None);
 
     let result = loop {
+        if epoll_guard_published && signals.holds_signal() {
+            // A later probe may have absorbed a signal that the private mask
+            // does not block. Such a held slot is no longer a proven boundary.
+            crate::tool_global::native_epoll_guard(guest, None).await;
+            epoll_guard_published = false;
+        }
         interrupt_after_probe = false;
         // A scheduler `Signaled` answer only says a signal may be pending. The kernel's
         // state below decides whether it ends the wait.
@@ -4809,6 +5027,19 @@ where
                 Err(error) => break Err(error),
             }
         }
+        if observe_dependencies {
+            rsrc.io_dependencies =
+                crate::event_driven_io::observe(guest, call.into(), rsrc.poll_attempt).await;
+            observe_dependencies = rsrc.io_dependencies.is_some();
+            if rsrc.io_dependencies.is_some() {
+                // Unlike a runnable probe, a dependency waiter must be woken
+                // when an interrupting signal arrives. The helper still owns
+                // the private mask and decides completion before interruption.
+                rsrc.set_signal_interrupt_errno(call0.signal_interrupt_errno());
+                rsrc.signal_state_task = guest_signal_state_task(guest);
+                rsrc.private_sigchld_decides = true;
+            }
+        }
         let first = std::mem::take(&mut first_turn);
         // Never `inject_with_retry`: see `KernelSignalWait`.
         let injected = if first {
@@ -4856,6 +5087,14 @@ where
                 break Err(error);
             }
         };
+        trace_read_poll_wait(
+            guest,
+            call0.into(),
+            "probe",
+            rsrc.poll_attempt,
+            Some(&syscall_result.map_err(Error::from)),
+            Some(call.syscall_would_have_blocked(syscall_result)),
+        );
         if !call.syscall_would_have_blocked(syscall_result) {
             let normalized =
                 call.normalize_nonblocking_result(syscall_result, rsrc.poll_attempt > 0);
@@ -4904,7 +5143,23 @@ where
             if let Err(error) = signals.block(guest, None).await {
                 break Err(error);
             }
+            let mask_changed = published.0 != signals.effective_mask();
             publish_wait_mask(guest, signals.effective_mask(), &mut published).await;
+            if mask_changed {
+                // Generic publication revokes the scheduler's provenance.
+                epoll_guard_published = false;
+            }
+            if native_epoll_guard
+                && !epoll_guard_published
+                && !signals.holds_signal()
+                && let Some(original) = signals.saved_mask
+            {
+                let physical = (blocked_signal_mask() | original)
+                    & !kernel_sigset_bit(libc::SIGKILL)
+                    & !kernel_sigset_bit(libc::SIGSTOP);
+                crate::tool_global::native_epoll_guard(guest, Some((original, physical))).await;
+                epoll_guard_published = true;
+            }
             (call, guard) = call0.into_nonblocking(guest).await;
         }
         rsrc.poll_attempt += 1;
@@ -4935,10 +5190,18 @@ where
         }
         record_retry_event(guest, call).await;
     };
+    trace_read_poll_wait(
+        guest, call0.into(), "end", rsrc.poll_attempt, Some(&result), None,
+    );
 
     drop(guard);
     let restored = signals.restore(guest, None).await;
     publish_wait_mask(guest, None, &mut published).await;
+    if epoll_guard_published {
+        // The scheduler verifies the actual restored mask; this is not a
+        // promise that restoration succeeded, nor a dequeue receipt.
+        crate::tool_global::native_epoll_guard(guest, None).await;
+    }
     let result = match result_after_restore(restored, result) {
         Ok(result) => result,
         Err(error) => return (Err(error), false),
@@ -7707,122 +7970,6 @@ pub(crate) mod kernel_signal_wait_failures {
         fn live(mask: KernelSigset) -> (Self, Kernel) {
             // SAFETY: gettid has no preconditions.
             Self::new(Pid::from_raw(unsafe { libc::gettid() }), mask)
-        }
-    }
-
-    /// The decision `ioaction_based_on_fd_status` takes from the call's own
-    /// flags. On a socket the guest left blocking, which Detcore keeps
-    /// physically nonblocking, a send or receive is retried until it stops
-    /// failing with `EAGAIN` (`NonblockizeRetry`), unless its flags carry
-    /// `MSG_DONTWAIT`: then it runs once (`PassThru`), as Linux runs it.
-    /// recvmmsg's `MSG_WAITFORONE` alone still waits for the first datagram.
-    /// On a socket the guest made `O_NONBLOCK`, every call runs once, and on
-    /// one Detcore leaves physically blocking every call takes the blocking
-    /// path.
-    #[test]
-    fn msg_dontwait_runs_a_call_once_on_a_socket_the_guest_left_blocking() {
-        use std::os::fd::AsRawFd;
-
-        use reverie::syscalls::Recvfrom;
-        use reverie::syscalls::Recvmmsg;
-        use reverie::syscalls::Recvmsg;
-        use reverie::syscalls::Sendmmsg;
-        use reverie::syscalls::Sendmsg;
-        use reverie::syscalls::Sendto;
-
-        let (mut guest, _) = WaitGuest::live(guest_mask());
-        let (socket, _peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
-        let fd = socket.as_raw_fd();
-        guest
-            .thread
-            .add_fd(fd, nix::fcntl::OFlag::O_RDWR, FdType::Socket, None)
-            .unwrap();
-        let dontwait = libc::MSG_DONTWAIT;
-        let waitforone = libc::MSG_WAITFORONE;
-        let once = Ok(IOAction::PassThru);
-        let retry = Ok(IOAction::NonblockizeRetry);
-        let decisions = |guest: &mut WaitGuest| {
-            [
-                (
-                    "recvfrom",
-                    ioaction_based_on_fd_status(
-                        guest,
-                        Recvfrom::new().with_fd(fd).with_flags(dontwait),
-                    ),
-                    ioaction_based_on_fd_status(guest, Recvfrom::new().with_fd(fd)),
-                ),
-                (
-                    "recvmsg",
-                    ioaction_based_on_fd_status(
-                        guest,
-                        Recvmsg::new().with_sockfd(fd).with_flags(dontwait),
-                    ),
-                    ioaction_based_on_fd_status(guest, Recvmsg::new().with_sockfd(fd)),
-                ),
-                (
-                    "recvmmsg",
-                    ioaction_based_on_fd_status(
-                        guest,
-                        Recvmmsg::new()
-                            .with_fd(fd)
-                            .with_flags((waitforone | dontwait) as u32),
-                    ),
-                    ioaction_based_on_fd_status(
-                        guest,
-                        Recvmmsg::new().with_fd(fd).with_flags(waitforone as u32),
-                    ),
-                ),
-                (
-                    "sendto",
-                    ioaction_based_on_fd_status(
-                        guest,
-                        Sendto::new().with_fd(fd).with_flags(dontwait as u32),
-                    ),
-                    ioaction_based_on_fd_status(guest, Sendto::new().with_fd(fd)),
-                ),
-                (
-                    "sendmsg",
-                    ioaction_based_on_fd_status(
-                        guest,
-                        Sendmsg::new().with_fd(fd).with_flags(dontwait),
-                    ),
-                    ioaction_based_on_fd_status(guest, Sendmsg::new().with_fd(fd)),
-                ),
-                (
-                    "sendmmsg",
-                    ioaction_based_on_fd_status(
-                        guest,
-                        Sendmmsg::new().with_sockfd(fd).with_flags(dontwait),
-                    ),
-                    ioaction_based_on_fd_status(guest, Sendmmsg::new().with_sockfd(fd)),
-                ),
-            ]
-        };
-        // A socket Detcore leaves physically blocking (an external socket
-        // under record and replay) keeps the blocking path, flag or not.
-        for (name, with_dontwait, without) in decisions(&mut guest) {
-            let blocking = Ok(IOAction::Blocking);
-            assert_eq!(
-                with_dontwait, blocking,
-                "{name} with MSG_DONTWAIT, blocking"
-            );
-            assert_eq!(without, blocking, "{name} without MSG_DONTWAIT, blocking");
-        }
-        guest
-            .thread
-            .with_detfd(fd, |d| d.set_physically_nonblocking())
-            .unwrap();
-        for (name, with_dontwait, without) in decisions(&mut guest) {
-            assert_eq!(with_dontwait, once, "{name} with MSG_DONTWAIT");
-            assert_eq!(without, retry, "{name} without MSG_DONTWAIT");
-        }
-        guest
-            .thread
-            .with_detfd(fd, |d| d.set_nonblocking(true))
-            .unwrap();
-        for (name, with_dontwait, without) in decisions(&mut guest) {
-            assert_eq!(with_dontwait, once, "{name} with MSG_DONTWAIT, O_NONBLOCK");
-            assert_eq!(without, once, "{name} without MSG_DONTWAIT, O_NONBLOCK");
         }
     }
 

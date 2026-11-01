@@ -272,6 +272,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/connect_source_port.c",
+      "runner": "hermit-cli/tests/cli.rs and tests/e2e/lib/determinism-stress/syscalls.sh",
+      "why": "Strict replay of real IPv4/IPv6 TCP and UDP clients, peer-address agreement, explicit binds, invalid arguments, descriptor aliases, nonblocking connects, restoration of per-socket range constraints, UDP disconnect/reconnect and port-space recycling, and consecutive TCP clients in TIME_WAIT."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/copied_priority_query.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/copied_priority_query.c is owned by hermit-cli/tests/cli.rs: dbt_refuses_a_vfork_childs_priority_query_by_name checks the shared priority model and exact named strict copied-child refusal, including guest status and stderr."
@@ -511,6 +517,12 @@
       "why": "tests/c/event_delivery_ordering.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): it is the deliberate complement to inotify_watch.c and signalfd_create.c, which both stop short of reading an event; ptrace is calibrated for blocking verification, DBT does not complete the guest and KVM omits the inotify family"
     },
     {
+      "disposition": "cargo-integration-test-fixture",
+      "path": "tests/c/event_driven_io.c",
+      "runner": "cargo test -p hermit-run --test event_driven_io",
+      "why": "Native readiness and strict-repeat regressions for scheduler-owned IO waits and real idle-time jumps, with conservative fallback outside proven producer domains."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/eventfd_probe.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
@@ -631,6 +643,12 @@
       "why": "tests/c/file_timestamp_identity.c is owned by target/debug/test-harness via tests/e2e/manifests/system-utils.yaml: creates files and directories, prints their stat and statx metadata including atime/mtime/ctime/btime and the mtime ORDERING between them, and exercises utimensat fixed and UTIME_NOW, so verify's double run asserts guest-created file timestamps are reproducible without freezing them"
     },
     {
+      "disposition": "cargo-integration-test-fixture",
+      "path": "tests/c/fixed_guest_identity.c",
+      "runner": "cargo test -p hermit-run --test fixed_guest_identity",
+      "why": "Guest-visible fixed UID/GID behavior is exercised by the dedicated integration test under native ptrace."
+    },
+    {
       "disposition": "suite-helper",
       "path": "tests/c/fixture_cpuset_shim.c",
       "runner": "tests/c/fixture_mutation.py",
@@ -659,6 +677,12 @@
       "path": "tests/c/flock_lifecycle.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/flock_lifecycle.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "cargo-integration-test-fixture",
+      "path": "tests/c/flock_wait.c",
+      "runner": "cargo test -p hermit-run --test flock_exclusion",
+      "why": "Native Linux controls and canonical strict repeats for blocking flock handoff, shared exclusion, conversion, OFD lifetime across dup/fork/exit/fd reuse and SCM_RIGHTS, signal interruption and restart; external ownership and unaccounted native rights remain named refusals."
     },
     {
       "disposition": "guest-fixture",
@@ -1198,7 +1222,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/kill_process_group.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/kill_process_group.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test a_signal_to_a_process_group_is_refused_by_name compiles this guest, which sends rt_sigqueueinfo and kill to pid 0 and to its own negative process-group id, and requires Linux's ESRCH for rt_sigqueueinfo, the policy-refusal status naming kill under a fail-closed run, and ENOSYS with --allow-unsupported-syscalls (https://github.com/rrnewton/hermit/issues/4046); it remains a guest fixture because a generic manifest cannot assert this exact output or refusal status."
+      "why": "tests/c/kill_process_group.c is owned by hermit-cli/tests/cli.rs: modeled_process_group_signals_deliver_but_broadcast_is_refused checks native modeled-group delivery, Linux ESRCH for rt_sigqueueinfo, and fail-closed broadcast refusal versus compatibility ENOSYS. Other modes cover non-sequentialized host-group containment and KVM singleton-self group SIGKILL. These backend and policy assertions require the Rust integration runner."
     },
     {
       "disposition": "guest-fixture",
@@ -1964,6 +1988,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/process_group_delivery.c",
+      "runner": "hermit-cli/tests/process_group_delivery.rs",
+      "why": "Native Linux oracle and ptrace strict-verification regression for multi-process group delivery, exactly-once process-pending delivery to blocked multi-threaded members, SI_USER sender identity, exclusion of another group, own-group delivery, reaped-group ESRCH, and a group sender that terminates itself without stranding its sibling."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/process_groups.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/process_groups.c is owned by hermit-cli/tests/cli.rs: the CLI test process_groups_and_sessions_answer_as_linux_on_every_backend compiles it and runs it on every backend, requiring the process-group and session answers Linux gives a process started in a new PID namespace (getpgrp, getpgid, getsid, setpgid, setsid and their refusals), the same on every backend, from Detcore's model (slice B3a-4c of https://github.com/rrnewton/hermit/issues/4266). LiteInst and in-guest-trap are named as not yet."
@@ -1979,6 +2009,12 @@
       "path": "tests/c/process_signal_receiver.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/process_signal_receiver.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration tests a_process_directed_signal_goes_to_the_thread_linux_chooses and a_signal_to_the_senders_own_process_that_another_thread_takes_is_refused_by_name compile this guest, which sends process-directed signals to multi-threaded processes (a parent's SIGTERM to a four-thread child whose threads all, all but one, or none leave it unblocked, a worker's pidfd SIGSEGV to its own process at the default disposition, and a worker's SIGUSR1 to its own process) and prints the receiving thread and its siginfo, and requires Linux's output under --strict, at bitwise parity for the three SIGTERM modes, and the named refusal for the SIGUSR1 mode (https://github.com/rrnewton/hermit/issues/4034); it remains a guest fixture because a generic manifest cannot assert this exact output, refusal reason or verdict."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/process_signal_reservation.c",
+      "runner": "hermit-cli/tests/cli.rs and tests/e2e/lib/determinism-stress/syscalls.sh",
+      "why": "Native process-shared signal receiver and dequeue guarantees: handler thread, original sender process and UID, SI_USER, exactly-once delivery, competing mask changes, separate thread-pending copies, and post-send synchronous consumers; competing kernel sigwait/signalfd consumers remain refused."
     },
     {
       "disposition": "manifest-test",
@@ -2690,6 +2726,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/sigchld_progress.c",
+      "runner": "tests/e2e/lib/determinism-stress/syscalls.sh",
+      "why": "Strict runtime regression requiring a parent to reap children within a bounded number of yields while unrelated services stay runnable, without ignored SIGCHLD delivery turns starving progress."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/sigkill_cross_process.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/sigkill_cross_process.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration tests a_cross_process_sigkill_verifies_at_bitwise_parity, a_cross_process_sigkill_of_a_child_or_own_group_verifies_at_bitwise_parity, a_cross_process_sigkill_edge_case_verifies_at_bitwise_parity, a_cross_process_sigkill_notification_verifies_at_bitwise_parity, a_late_or_vectored_sigkill_notification_read_verifies_at_bitwise_parity and a_positioned_or_self_read_sigkill_notification_verifies_at_bitwise_parity (one mode table, split so each stays inside the per-test CPU and wall budgets, https://github.com/rrnewton/hermit/issues/4220 and https://github.com/rrnewton/hermit/issues/4783) compile this guest, in which a process kills its parent with SIGKILL (with and without a bystander process taking scheduler turns), and requires five consecutive `run --strict --verify --verify-strict` runs per mode to reach canonical bitwise parity and print how the parent ended (https://github.com/rrnewton/hermit/issues/3994); it remains a guest fixture because a manifest cell runs one verified run, while this regression needs repeated runs to show the retirement no longer lands at a host-chosen position."
@@ -2950,7 +2992,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/socket_dontwait.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/socket_dontwait.c is owned by hermit-cli/tests/cli.rs: msg_dontwait_returns_at_once_on_a_blocking_socket runs it natively, under ptrace with --strict and without, and its socketpair sections under record start --verify, and requires byte-identical output with a fixed expectation: on UDP, AF_UNIX datagram and stream socketpairs and TCP sockets left blocking, recvfrom, recvmsg, recvmmsg, sendto, sendmsg and sendmmsg with MSG_DONTWAIT return -1 EAGAIN at once with nothing queued or a full peer and the data when it is queued, while recvmmsg with MSG_WAITFORONE alone and a send without the flag still wait. It stays a fixture because the test compares native and Hermit output."
+      "why": "The CLI test msg_dontwait_returns_at_once_on_a_blocking_socket compares native and Hermit UDP/TCP/UNIX datagram/stream behavior across all six socket message APIs, including EAGAIN, successful sends/receives, MSG_WAITFORONE, blocking sends, descriptor aliases and flags, EBADF, zero-length datagrams and bounded full queues. The descriptor_flags section also requires strict native-ptrace verification; socketpair sections retain record start --verify coverage."
     },
     {
       "disposition": "manifest-test",
@@ -3148,13 +3190,13 @@
       "disposition": "guest-fixture",
       "path": "tests/c/sysv_sem_enosys.c",
       "runner": "hermit-cli/tests/sysv_legacy_fallbacks.rs",
-      "why": "tests/c/sysv_sem_enosys.c is owned by hermit-cli/tests/sysv_legacy_fallbacks.rs: the test compiles it with -Werror and requires a ptrace run --strict --verify --panic-on-unsupported-syscalls to report Determinism verified, so a raw semget must return ENOSYS. Its former manifest row was deleted by the 2026-10-17 test audit because c-programs/sysv-ipc-refusal asserts the semget, shmget and msgget refusals on the same six backends."
+      "why": "Ptrace strict-verification semaphore refusal regression; c-programs/sysv-ipc-refusal additionally asserts semget/msgget refusal across its backend matrix, independently of shared-backing support."
     },
     {
       "disposition": "guest-fixture",
-      "path": "tests/c/sysv_shm_enosys.c",
+      "path": "tests/c/sysv_shm.c",
       "runner": "hermit-cli/tests/sysv_legacy_fallbacks.rs",
-      "why": "tests/c/sysv_shm_enosys.c is owned by hermit-cli/tests/sysv_legacy_fallbacks.rs: the test compiles it with -Werror and requires a ptrace run --strict --verify --panic-on-unsupported-syscalls to report Determinism verified, so a raw shmget must return ENOSYS. Its former manifest row was deleted by the 2026-10-17 test audit because c-programs/sysv-ipc-refusal asserts the semget, shmget and msgget refusals on the same six backends."
+      "why": "Native ptrace and KVM real shared-memory regression: shared bytes across aliases/fork, IPC_STAT counts, deferred removal, permissions, failed map/copyout, descriptor isolation, exec/exit cleanup; strict verification under virtual root and uid/gid 1000."
     },
     {
       "disposition": "manifest-test",
@@ -3407,6 +3449,12 @@
       "path": "tests/c/vfork_child_waits.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/vfork_child_waits.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test a_vfork_child_waiting_for_another_thread_completes_at_bitwise_parity compiles this guest, a vfork child that waits (for a forked grandchild, for a pipe a forked sibling writes, or on calls the host times while a sibling thread spins), and requires all three modes to finish at bitwise parity, the first two with their exact output under hermit run --strict --verify --verify-strict; hermit-cli/tests/record_replay.rs record_vfork_child_waiting_for_another_thread records and replays those three modes and the sibling-poll and sibling-poll-timeout modes, a vfork child polling a pipe a forked writer fills, at bitwise parity (https://github.com/rrnewton/hermit/issues/4194: Detcore selected only the vfork child while a barrier stood, so such a child waited forever; https://github.com/rrnewton/hermit/issues/4211: under record the poll ran in the background and no other thread ran); it remains a guest fixture because a generic manifest cannot assert this exact output."
+    },
+    {
+      "disposition": "cargo-integration-test-fixture",
+      "path": "tests/c/vfork_exec_fairness.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "Strict repeat regression for vfork/exec scheduling progress while other guests remain runnable."
     },
     {
       "disposition": "guest-fixture",

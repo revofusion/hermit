@@ -2176,6 +2176,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         if is_vfork && let Some(refused) = super::helpers::kernel_run_entry_refusal(guest)? {
             return Err(refused);
         }
+        if self.cfg.event_driven_io
+            && flags.contains(CloneFlags::CLONE_THREAD)
+            && !flags.contains(CloneFlags::CLONE_FILES)
+        {
+            tracing::info!(target: "detcore::event_driven_io", "event-driven IO disabled: divergent thread file table");
+            crate::tool_global::event_driven_io(
+                guest, crate::event_driven_io::Update::Disable,
+            ).await;
+        }
 
         // A clone that makes a user namespace makes it the caller's effective
         // user ID's (`user_namespace_owner_may_differ`): read now, noted once
@@ -2864,6 +2873,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             Permission::RW,
         );
         resource_request(guest, request).await;
+        crate::event_driven_io::notify_lifecycle(guest).await;
         self.run_robust_list_owner_death(guest).await;
         // A leader whose group lives on is a zombie from here until its last
         // sibling leaves, and its backend reports its exit only then: it
@@ -2961,6 +2971,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             Permission::RW,
         );
         resource_request(guest, request).await;
+        crate::event_driven_io::notify_lifecycle(guest).await;
         if barrier {
             guest.thread_state().begin_exit_group_robust_walk();
             let owners = guest.thread_state().robust_list_owners_for_exit_group();
@@ -4356,6 +4367,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                 thread_state.mm_id,
             )
         };
+        old_memory_metadata
+            .lock()
+            .expect("memory metadata mutex poisoned")
+            .sysv_context(
+                detpid.as_raw(),
+                guest
+                    .thread_state()
+                    .peek_guest_clock(guest.thread_state().thread_logical_time.as_nanos())
+                    .as_secs() as i64,
+            );
         let (mut new_metadata, closed_open_files, exec_fd_blocking) = {
             let metadata = old_metadata.lock().unwrap();
             // The exec'ing thread leads its process from here, alone.
@@ -4421,6 +4442,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // the table exec gives it is the process's (`process_files`), also
         // for a thread that did not lead it before.
         let old_process_files = guest.thread_state().process_files;
+        crate::event_driven_io::notify_lifecycle(guest).await;
 
         {
             let thread_state = guest.thread_state_mut();

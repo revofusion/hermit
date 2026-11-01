@@ -895,7 +895,36 @@ impl<T: RecordOrReplay> Detcore<T> {
             .as_ref()
             .map_or(syscall, |translated| translated.call);
         crate::reserved_input::before_native_call(guest, call)?;
-        let result = if crate::record_or_replay::injects_only::<T>() {
+        let result = if crate::event_driven_io::may_bookkeep_socket_attempt(guest, call) {
+            // Keep both hooks' state out of every forwarded syscall's future.
+            // The shared gate allocates only for enabled socket bookkeeping.
+            Box::pin(self.record_or_replay_with_socket_attempt(guest, call)).await
+        } else {
+            self.forward_record_or_replay(guest, call).await
+        };
+        if let Some(translated) = translated {
+            Box::pin(Self::finish_translated_call(guest, translated)).await;
+        }
+        result
+    }
+
+    async fn record_or_replay_with_socket_attempt<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+    ) -> Result<i64, Error> {
+        let socket_probe = crate::event_driven_io::before_socket_attempt(guest, call).await;
+        let result = self.forward_record_or_replay(guest, call).await;
+        crate::event_driven_io::after_socket_attempt(guest, call, &result, socket_probe).await;
+        result
+    }
+
+    async fn forward_record_or_replay<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+    ) -> Result<i64, Error> {
+        if crate::record_or_replay::injects_only::<T>() {
             // What the tool's handler would have done (`NoopTool`), here:
             // the same single injection of the same call, awaited at the
             // same point, with its errno converted the same way.
@@ -904,11 +933,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             self.record_or_replay
                 .handle_syscall_event(&mut guest.into_guest(), call)
                 .await
-        };
-        if let Some(translated) = translated {
-            Box::pin(Self::finish_translated_call(guest, translated)).await;
         }
-        result
     }
 
     /// Helper function for delegating the injection of a syscall to the
@@ -7696,6 +7721,7 @@ impl<T> ThreadState<T> {
             priority_row: None,
             slice_expired: false,
             zero_length_sleep: false,
+            io_dependencies: None,
         }
     }
 

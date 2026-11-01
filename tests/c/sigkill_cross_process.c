@@ -10,6 +10,8 @@
 // exits; main prints each notification's code, status and sender. Mode
 // "pgroup": A leads its own process group, and its child A2 is in it; B, in
 // main's group, sends kill(-pgid, SIGKILL); main waits for A and for B.
+// "parentgroup" repeatedly kills a session leader and its multithreaded exec
+// descendant: SIGCHLD must not interrupt the group's remaining native sends.
 // Two modes kill the sender's own process, so the send cannot return: in
 // "selfgroup" a non-leader thread of A tgkills A's leader while a bystander B
 // takes turns; in "pgself" A, leading a group that also holds its child A2,
@@ -76,6 +78,7 @@
 #include <time.h>
 #include <linux/futex.h>
 #include <sys/wait.h>
+#include <sys/prctl.h>
 #include <unistd.h>
 
 #define YIELDS 200
@@ -1174,8 +1177,121 @@ static int signalfd_positioned_mode(void) {
   return 0;
 }
 
+static pthread_barrier_t group_ready;
+
+static void group_child_notice(int sig) { (void)sig; }
+
+static void *group_worker(void *unused) {
+  (void)unused;
+  pthread_barrier_wait(&group_ready);
+  for (;;) pause();
+  return NULL;
+}
+
+static pid_t group_reap(pid_t child, int *status, int flags) {
+  pid_t result;
+  do { result = waitpid(child, status, flags); } while (result < 0 && errno == EINTR);
+  return result;
+}
+
+static int group_killed(int status) {
+  return WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL;
+}
+
+static int parentgroup_leaf_mode(int output) {
+  pthread_t threads[16];
+  struct sigaction action = {.sa_handler = group_child_notice, .sa_flags = SA_RESTART};
+  sigemptyset(&action.sa_mask);
+  if (sigaction(SIGCHLD, &action, NULL) ||
+      pthread_barrier_init(&group_ready, NULL, 17)) return 91;
+  for (int i = 0; i < 16; ++i)
+    if (pthread_create(&threads[i], NULL, group_worker, NULL)) return 92;
+  pthread_barrier_wait(&group_ready);
+  pid_t helper = fork();
+  if (helper < 0) return 93;
+  if (helper == 0) _exit(setsid() < 0 ? 94 : 0);
+  int status;
+  if (group_reap(helper, &status, 0) != helper || status != 0) return 95;
+  pid_t me = getpid();
+  if (write(output, &me, sizeof(me)) != sizeof(me)) return 96;
+  for (;;) pause();
+}
+
+static int parentgroup_mode(const char *program) {
+  if (prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)) return 80;
+  for (int iteration = 0; iteration < 64; ++iteration) {
+    int channel[2];
+    if (pipe(channel)) return 81;
+    pid_t leader = fork();
+    if (leader < 0) return 82;
+    if (leader == 0) {
+      close(channel[0]);
+      if (setsid() < 0) _exit(83);
+      pid_t child = fork();
+      if (child < 0) _exit(84);
+      if (child == 0) {
+        char fd[32];
+        snprintf(fd, sizeof(fd), "%d", channel[1]);
+        execl(program, program, "parentgroupleaf", fd, (char *)NULL);
+        _exit(85);
+      }
+      close(channel[1]);
+      for (;;) pause();
+    }
+    close(channel[1]);
+    pid_t child = -1;
+    ssize_t bytes;
+    do { bytes = read(channel[0], &child, sizeof(child)); } while (bytes < 0 && errno == EINTR);
+    close(channel[0]);
+    if (bytes != sizeof(child) || child <= 0) {
+      kill(-leader, SIGKILL);
+      group_reap(leader, &(int){0}, 0);
+      fprintf(stderr, "leaf readiness failed at iteration %d\n", iteration);
+      return 86;
+    }
+    int sent = kill(-leader, SIGKILL);
+    int leader_status, child_status = 0;
+    if (sent < 0) {
+      int error = errno;
+      kill(leader, SIGKILL);
+      kill(child, SIGKILL);
+      group_reap(leader, &leader_status, 0);
+      group_reap(child, &child_status, 0);
+      fprintf(stderr, "group send failed at iteration %d: errno=%d\n", iteration, error);
+      return 87;
+    }
+    if (group_reap(leader, &leader_status, 0) != leader || !group_killed(leader_status)) {
+      kill(child, SIGKILL);
+      group_reap(child, &child_status, 0);
+      return 88;
+    }
+    // A missed send must fail rather than leave verification waiting forever.
+    pid_t result = 0;
+    for (int attempt = 0; attempt < 4096 && result == 0; ++attempt) {
+      result = group_reap(child, &child_status, WNOHANG);
+      if (result == 0) sched_yield();
+    }
+    if (result != child || !group_killed(child_status)) {
+      int error = errno;
+      kill(child, SIGKILL);
+      group_reap(child, &child_status, 0);
+      fprintf(stderr, "group missed live descendant at iteration %d: wait=%d errno=%d\n",
+              iteration, result, error);
+      return 77;
+    }
+  }
+  puts("64 parent-owned groups, including multithreaded exec descendants, killed and reaped");
+  return 0;
+}
+
 int main(int argc, char **argv) {
   const char *mode = argc > 1 ? argv[1] : "";
+  if (strcmp(mode, "parentgroup") == 0) {
+    return parentgroup_mode(argv[0]);
+  }
+  if (strcmp(mode, "parentgroupleaf") == 0 && argc == 3) {
+    return parentgroup_leaf_mode(atoi(argv[2]));
+  }
   if (strcmp(mode, "parentkill") == 0) {
     return parentkill_mode(0);
   }

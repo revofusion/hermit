@@ -398,6 +398,8 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::semop
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::semtimedop
+        // TODO-HUMAN-REVIEW(pending-local-review): shared memory now uses
+        // run-owned backing on KVM; unsupported backends still return ENOSYS.
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::shmat
         // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1119,8 +1121,8 @@ pub(crate) const fn is_ownership_change_noop_syscall(sysno: Sysno) -> bool {
 // TODO-HUMAN-REVIEW(#731): Deterministic ENOSYS refusal set.
 /// Asynchronous and message-passing I/O and IPC interfaces Detcore does not
 /// model: Linux native AIO (`io_setup`/`io_destroy`/`io_submit`/`io_cancel`/
-/// `io_getevents`/`io_pgetevents`), POSIX message queues (`mq_*`), and all three
-/// System V IPC families (`msg*`, `sem*`, and `shm*`). AIO completion is
+/// `io_getevents`/`io_pgetevents`), POSIX message queues (`mq_*`), and System V
+/// message queues and semaphores (`msg*`, `sem*`). AIO completion is
 /// kernel-driven and lives outside the guest's logical time, and the IPC
 /// families operate on global, key-addressed kernel objects that persist across
 /// runs and are shared with the whole host. Forwarding them (the legacy
@@ -1161,14 +1163,21 @@ pub(crate) const fn is_unsupported_async_ipc_syscall(sysno: Sysno) -> bool {
             | Sysno::semop
             // AUTONOMOUS-BOT-IMPLEMENTED
             | Sysno::semtimedop
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            | Sysno::shmat
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            | Sysno::shmctl
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            | Sysno::shmdt
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            | Sysno::shmget
+    )
+}
+
+/// Run-owned shared memory on an explicit local-backing backend; ENOSYS elsewhere.
+pub(crate) const fn is_sysv_shm(sysno: Sysno) -> bool {
+    matches!(
+        sysno,
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        Sysno::shmat
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::shmctl
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::shmdt
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::shmget
     )
 }
 
@@ -2224,7 +2233,7 @@ mod tests {
         }
         // Batch 7: asynchronous and message-passing I/O and IPC interfaces
         // Detcore does not model are refused with a deterministic ENOSYS (Linux
-        // native AIO, POSIX message queues, and all System V IPC families); see
+        // native AIO, POSIX message queues, and SysV messages/semaphores); see
         // is_unsupported_async_ipc_syscall.
         for sysno in [
             Sysno::io_setup,
@@ -2247,13 +2256,14 @@ mod tests {
             Sysno::semget,
             Sysno::semop,
             Sysno::semtimedop,
-            Sysno::shmat,
-            Sysno::shmctl,
-            Sysno::shmdt,
-            Sysno::shmget,
         ] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
             assert!(is_unsupported_async_ipc_syscall(sysno));
+        }
+        for sysno in [Sysno::shmat, Sysno::shmctl, Sysno::shmdt, Sysno::shmget] {
+            assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
+            assert!(is_sysv_shm(sysno));
+            assert!(!is_deterministically_refused_syscall(sysno));
         }
     }
 

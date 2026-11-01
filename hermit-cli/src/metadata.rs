@@ -1342,6 +1342,9 @@ fn record_or_replay_config_with_timer_support(
         // the option existed, and record mode's own scheduling, have no
         // hand-off (https://github.com/rrnewton/hermit/issues/4380).
         pipe_wake_latency: None,
+        // Event-driven IO is a run policy, not a legacy recording policy.
+        event_driven_io: false,
+        event_driven_private_tmp: None,
         // Record and replay charge every expired timed wait, whatever the value.
         expired_wait_charge: None,
         // Record and replay register queued sleeps when chosen, whatever the value.
@@ -1411,6 +1414,8 @@ fn record_or_replay_config_with_timer_support(
         detlog_regs_cadence: 1,
         sysinfo_uptime_offset: 120,
         memory: default_config.memory,
+        virtual_uid: default_config.virtual_uid,
+        virtual_gid: default_config.virtual_gid,
         virtual_cpus: default_config.virtual_cpus,
         proc_level: default_config.proc_level,
         interrupt_at: vec![],

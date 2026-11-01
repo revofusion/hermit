@@ -1025,6 +1025,7 @@ mod tests {
         ),
         ("futex-wake-yields", &["--futex-wake-yields"]),
         ("pipe-wake-latency", &["--pipe-wake-latency=1000000"]),
+        ("event-driven-io", &["--event-driven-io"]),
         ("expired-wait-charge", &["--expired-wait-charge=once"]),
         (
             "work-span-report",
@@ -1089,6 +1090,8 @@ mod tests {
         ("detlog-regs-cadence", &["--detlog-regs-cadence=2"]),
         ("sysinfo-uptime-offset", &["--sysinfo-uptime-offset=60"]),
         ("memory", &["--memory=2GB"]),
+        ("virtual-uid", &["--virtual-uid=1000"]),
+        ("virtual-gid", &["--virtual-gid=1000"]),
         ("virtual-cpus", &["--virtual-cpus=4"]),
         ("proc", &["--proc=standard"]),
         (

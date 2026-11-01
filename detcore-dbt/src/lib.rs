@@ -2679,6 +2679,14 @@ pub unsafe extern "C" fn reverie_dbt_runtime_copied_syscall(sysnum: i64, args: *
     if strict && copied_child_reads_clock_or_limit(sysno, args) {
         return 1;
     }
+    // No local owned-backing bridge exists in a copied DBT child. Shared
+    // memory is emulated only by KVM; never fall through to host SysV IPC.
+    if matches!(
+        sysno,
+        Sysno::shmget | Sysno::shmat | Sysno::shmdt | Sysno::shmctl
+    ) {
+        return 1;
+    }
     if detcore::is_deterministically_refused_syscall(sysno)
         && (strict || !detcore::is_strict_only_deterministic_refusal_syscall(sysno))
     {
@@ -5989,6 +5997,21 @@ mod tests {
         // Strict: refused families and Unsupported syscalls fail-close (1);
         // ordinary passthrough syscalls continue natively (0).
         COPIED_PANIC_ON_UNSUPPORTED.store(true, Ordering::Release);
+        for strict in [false, true] {
+            COPIED_PANIC_ON_UNSUPPORTED.store(strict, Ordering::Release);
+            for number in [
+                libc::SYS_shmget,
+                libc::SYS_shmat,
+                libc::SYS_shmdt,
+                libc::SYS_shmctl,
+            ] {
+                assert_eq!(
+                    copied_child_action(number),
+                    1,
+                    "copied DBT child has no SysV backing bridge"
+                );
+            }
+        }
         for sysnum in [
             libc::SYS_splice,
             libc::SYS_tee,

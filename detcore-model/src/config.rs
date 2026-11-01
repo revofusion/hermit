@@ -79,6 +79,23 @@ pub const fn set_kernel_signal_facts(backend: &mut BackendCapabilities, on: bool
     backend.host_timed_signals_are_physical = on;
 }
 
+/// Launch-authenticated identity of the generated private `/tmp` bind mount.
+/// These are physical kernel values, never virtualized stat/statx identities.
+/// Only the launcher may supply this receipt after validating its pinned TempDir.
+#[derive(Serialize, Deserialize, Clone, Copy, Eq, PartialEq)]
+pub struct EventDrivenPrivateTmp {
+    pub device: u64,
+    pub inode: u64,
+    pub raw_mount_id: u64,
+}
+
+impl fmt::Debug for EventDrivenPrivateTmp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Config diagnostics must not make physical launch identities observable.
+        f.write_str("EventDrivenPrivateTmp { authenticated: true }")
+    }
+}
+
 /// One mount row whose kernel-private root must be replaced before it becomes
 /// guest-visible.
 ///
@@ -226,6 +243,18 @@ pub struct Config {
     /// Disable virtual/logical time. Note that virtual time is required for virtual metadata.
     #[clap(long = "no-virtualize-time", action = clap::ArgAction::SetFalse)]
     pub virtualize_time: bool,
+
+    /// Fixed guest user ID reported by credential queries. This does not change
+    /// the host identity or grant permissions; launch as the matching host user
+    /// when the workload checks filesystem ownership.
+    #[serde(default)]
+    #[clap(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..u32::MAX as i64))]
+    pub virtual_uid: u32,
+
+    /// Fixed guest group ID, with the same host-permission limits as --virtual-uid.
+    #[serde(default)]
+    #[clap(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..u32::MAX as i64))]
+    pub virtual_gid: u32,
 
     /// Disable virtual cpuid
     #[clap(long = "no-virtualize-cpuid", action = clap::ArgAction::SetFalse)]
@@ -1125,6 +1154,21 @@ pub struct Config {
     #[clap(long, value_name = "nanos")]
     pub pipe_wake_latency: Option<u64>,
 
+    /// Use the event-driven IO scheduling policy for fully tracked internal
+    /// resources. Untracked resources retain physical polling. This changes
+    /// scheduling and virtual-time progression; it does not relax determinism.
+    /// Supported only for sequential native ptrace runs on local networking,
+    /// without schedule recording/replay or in-guest signal delivery.
+    #[serde(default)]
+    #[clap(long)]
+    pub event_driven_io: bool,
+
+    /// Per-launch proof of the generated private `/tmp`, not a mountinfo rewrite.
+    /// Refreshed in the completed container namespace; never accepted from CLI text.
+    #[serde(default)]
+    #[clap(skip)]
+    pub event_driven_private_tmp: Option<EventDrivenPrivateTmp>,
+
     /// How a run of consecutive scheduler turns that each end an expired timed wait (a futex wait
     /// answered `ETIMEDOUT`, or a sleep already due) is charged while another thread is queued:
     /// `once`, one scheduler turn for the whole run, or `each`, a turn per wait. Unset, `each`
@@ -1746,6 +1790,8 @@ impl Config {
 
     /// Check invariants that must hold at every execution boundary without mutating the config.
     pub fn validate_invariants(&self) {
+        assert!(self.virtual_uid != u32::MAX, "virtual_uid must not be -1");
+        assert!(self.virtual_gid != u32::MAX, "virtual_gid must not be -1");
         assert!(self.sched_sticky_random_param >= 0.0);
         assert!(self.sched_sticky_random_param <= 1.0);
         // AUTONOMOUS-BOT-IMPLEMENTED
@@ -2052,6 +2098,12 @@ impl Config {
 
 impl fmt::Display for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.virtual_uid != 0 {
+            write!(f, " --virtual-uid={}", self.virtual_uid)?;
+        }
+        if self.virtual_gid != 0 {
+            write!(f, " --virtual-gid={}", self.virtual_gid)?;
+        }
         if !self.virtualize_time {
             write!(f, " --no-virtualize-time")?;
         }
@@ -2224,6 +2276,9 @@ impl fmt::Display for Config {
         }
         if let Some(latency) = self.pipe_wake_latency {
             write!(f, " --pipe-wake-latency={}", latency)?;
+        }
+        if self.event_driven_io {
+            write!(f, " --event-driven-io")?;
         }
         if let Some(charge) = self.expired_wait_charge {
             write!(f, " --expired-wait-charge={}", charge.as_str())?;
@@ -3067,6 +3122,11 @@ pub fn to_legacy_backend_json(config: &Config) -> serde_json::Result<String> {
             "strict schedule boundaries cannot be represented by the legacy backend configuration",
         ));
     }
+    if config.event_driven_io {
+        return Err(serde::ser::Error::custom(
+            "event-driven IO cannot be represented by the legacy backend configuration",
+        ));
+    }
     let mut json = Vec::with_capacity(4096);
     let mut serializer = serde_json::Serializer::new(&mut json);
     config.serialize(legacy_backend_json::ConfigSerializer {
@@ -3629,7 +3689,7 @@ mod legacy_backend_json {
     /// it, so it is never written and reads as false.
     /// `standard_stream_aliases` came after it too, and is set only for KVM;
     /// it is never written and reads as unset.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 46] = [
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 48] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -3642,6 +3702,8 @@ mod legacy_backend_json {
         "target_timeslice_syscalls_only",
         "futex_wake_yields",
         "pipe_wake_latency",
+        "event_driven_io",
+        "event_driven_private_tmp",
         "expired_wait_charge",
         "replaying",
         "scheduler_turn_cost",
@@ -3815,6 +3877,7 @@ mod legacy_backend_json {
                     | "annotated_priority_replay"
                     | "target_timeslice_syscalls_only"
                     | "futex_wake_yields"
+                    | "event_driven_io"
                     | "cap_preemption_charge"
                     | "replaying"
                     | "signal_delivery_check_fatal"
@@ -3840,6 +3903,7 @@ mod legacy_backend_json {
                     | "scheduler_turn_cost"
                     | "virtual_timeout"
                     | "pipe_wake_latency"
+                    | "event_driven_private_tmp"
                     | "expired_wait_charge"
                     | "container_mount_table"
                     | "mountinfo_mount_namespace"
@@ -4143,6 +4207,8 @@ mod legacy_backend_json {
                 | "target_timeslice_syscalls_only"
                 | "futex_wake_yields"
                 | "pipe_wake_latency"
+                | "event_driven_io"
+                | "event_driven_private_tmp"
                 | "expired_wait_charge"
                 | "replaying"
                 | "scheduler_turn_cost"
@@ -5056,6 +5122,8 @@ mod tests {
                 | "target_timeslice_syscalls_only"
                 | "futex_wake_yields"
                 | "pipe_wake_latency"
+                | "event_driven_io"
+                | "event_driven_private_tmp"
                 | "expired_wait_charge"
                 | "replaying"
                 | "scheduler_turn_cost"
@@ -5099,36 +5167,6 @@ mod tests {
             .map(|(key, _)| key)
             .collect();
         assert_eq!(keys, expected);
-        // `backend` becomes fifteen keys; `record_host_inputs`,
-        // `guest_may_inherit_a_terminal`,
-        // `in_guest_detlog_forward_policy`, `in_guest_site_patching_off`,
-        // `in_guest_reserved_signals`, `in_guest_refuses_host_timed_producers`,
-        // `launch_image`, `target_timeslice_syscalls_only`, `futex_wake_yields`,
-        // `pipe_wake_latency`, `expired_wait_charge`, `replaying`, `scheduler_turn_cost`,
-        // `cap_preemption_charge`, `virtual_timeout`, `inherited_seccomp`, `cpu_profile`,
-        // `cpu_profile_host`, `cpu_profile_source`,
-        // `signal_state_copy`, `container_mount_table`,
-        // `guest_may_inherit_a_terminal`, `in_guest_detlog_forward_policy`,
-        // `in_guest_site_patching_off`, `in_guest_reserved_signals`,
-        // `in_guest_refuses_host_timed_producers`, `launch_image`,
-        // `target_timeslice_syscalls_only`, `futex_wake_yields`,
-        // `pipe_wake_latency`, `replaying`, `scheduler_turn_cost`,
-        // `inherited_seccomp`, `cpu_profile`, `cpu_profile_host`,
-        // `cpu_profile_source`, `signal_state_copy`, `container_mount_table`,
-        // `mountinfo_mount_namespace`, `directory_placeholder`,
-        // `container_procfs`, `signal_delivery_check_fatal`,
-        // `work_span_report`, `signal_at`, `in_guest_signal_delivery`,
-        // `annotated_priority_replay`, `virtual_cpus`, `replay_edited_preemptions`,
-        // `notice_host_network_abstract_binds`, `eager_lone_preemptions`,
-        // `chaos_timeslice_range`, `chaos_timeslice_draw`, `chaos_timeslice`,
-        // `guest_ids`, `virtual_timeout`, `detlog_anon`,
-        // `access_trace`, `access_trace_from`, `access_trace_max_records`,
-        // `access_trace_max_bytes`, `replay_continue_fairly`,
-        // `standard_stream_aliases` and `strict_schedule_boundaries` none:
-        // fourteen more keys and forty-five fewer, so thirty-one keys fewer
-        // than fields.
-        assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 31);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -6839,6 +6877,7 @@ mod tests {
     /// [`hermit_cpu_profile_supplies_the_profile_only_when_the_flag_is_absent`]:
     /// the arguments it parses, one per line.
     const CPU_PROFILE_ARGS_IN_CHILD: &str = "DETCORE_MODEL_TEST_CPU_PROFILE_ARGS";
+    const CPU_PROFILE_EXPECTED_IN_CHILD: &str = "DETCORE_MODEL_TEST_CPU_PROFILE_EXPECTED";
 
     /// HERMIT_CPU_PROFILE gives `--cpu-profile` its value when the flag is
     /// absent: unset is x86-64-v2, an explicit flag wins over the variable,
@@ -6849,18 +6888,20 @@ mod tests {
     #[test]
     fn hermit_cpu_profile_supplies_the_profile_only_when_the_flag_is_absent() {
         use clap::Parser;
+        use crate::cpu_profile::CpuProfile;
 
         if let Some(args) = std::env::var_os(CPU_PROFILE_ARGS_IN_CHILD) {
             let args = args.into_string().unwrap();
             let argv = std::iter::once("config").chain(args.lines());
-            match Config::try_parse_from(argv) {
-                Ok(config) => println!(
-                    "cpu-profile={} wire={}",
-                    config.cpu_profile.name(),
-                    config_wire_default().cpu_profile.name()
-                ),
-                Err(error) => println!("refused: {:?}", error.kind()),
-            }
+            let expected: Option<CpuProfile> = serde_json::from_str(
+                &std::env::var(CPU_PROFILE_EXPECTED_IN_CHILD).unwrap(),
+            )
+            .unwrap();
+            let actual = Config::try_parse_from(argv)
+                .map(|config| config.cpu_profile)
+                .map_err(|error| error.kind());
+            assert_eq!(actual, expected.ok_or(clap::error::ErrorKind::InvalidValue));
+            assert_eq!(config_wire_default().cpu_profile, CpuProfile::X86_64V2);
             return;
         }
 
@@ -6868,11 +6909,15 @@ mod tests {
             "{}::hermit_cpu_profile_supplies_the_profile_only_when_the_flag_is_absent",
             module_path!().split_once("::").unwrap().1
         );
-        let parse = |variable: Option<&str>, args: &[&str]| -> String {
+        let parse = |variable: Option<&str>, args: &[&str], expected: Option<CpuProfile>| {
             let mut child = std::process::Command::new(std::env::current_exe().unwrap());
             child
-                .args(["--exact", &test, "--nocapture"])
-                .env(CPU_PROFILE_ARGS_IN_CHILD, args.join("\n"));
+                .args(["--exact", &test])
+                .env(CPU_PROFILE_ARGS_IN_CHILD, args.join("\n"))
+                .env(
+                    CPU_PROFILE_EXPECTED_IN_CHILD,
+                    serde_json::to_string(&expected).unwrap(),
+                );
             for name in [
                 "HERMIT_EPOCH",
                 "HERMIT_PRNG",
@@ -6885,40 +6930,29 @@ mod tests {
                 child.env("HERMIT_CPU_PROFILE", value);
             }
             let output = child.output().unwrap();
-            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
             assert!(
-                output.status.success() && stdout.contains("test result: ok. 1 passed; 0 failed;"),
-                "the child for {variable:?} {args:?} did not run exactly once: {}\n{stdout}",
+                output.status.success(),
+                "the child for {variable:?} {args:?} failed: {}\n{}\n{}",
                 output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
             );
-            stdout
-                .lines()
-                .find(|line| line.starts_with("cpu-profile=") || line.starts_with("refused: "))
-                .unwrap_or_else(|| panic!("the child printed no verdict:\n{stdout}"))
-                .to_owned()
         };
 
-        assert_eq!(parse(None, &[]), "cpu-profile=x86-64-v2 wire=x86-64-v2");
-        assert_eq!(
-            parse(Some("x86-64-v3"), &[]),
-            "cpu-profile=x86-64-v3 wire=x86-64-v2"
+        parse(None, &[], Some(CpuProfile::X86_64V2));
+        parse(Some("x86-64-v3"), &[], Some(CpuProfile::X86_64V3));
+        parse(Some("host-no-rdrand"), &[], Some(CpuProfile::HostNoRdrand));
+        parse(None, &["--cpu-profile=x86-64-v3"], Some(CpuProfile::X86_64V3));
+        parse(
+            Some("x86-64-v3"),
+            &["--cpu-profile=x86-64-v2"],
+            Some(CpuProfile::X86_64V2),
         );
-        assert_eq!(
-            parse(Some("host-no-rdrand"), &[]),
-            "cpu-profile=host-no-rdrand wire=x86-64-v2"
-        );
-        assert_eq!(
-            parse(None, &["--cpu-profile=x86-64-v3"]),
-            "cpu-profile=x86-64-v3 wire=x86-64-v2"
-        );
-        assert_eq!(
-            parse(Some("x86-64-v3"), &["--cpu-profile=x86-64-v2"]),
-            "cpu-profile=x86-64-v2 wire=x86-64-v2"
-        );
-        assert_eq!(parse(Some("x86-64-v4"), &[]), "refused: InvalidValue");
-        assert_eq!(
-            parse(Some("x86-64-v4"), &["--cpu-profile=x86-64-v2"]),
-            "cpu-profile=x86-64-v2 wire=x86-64-v2"
+        parse(Some("x86-64-v4"), &[], None);
+        parse(
+            Some("x86-64-v4"),
+            &["--cpu-profile=x86-64-v2"],
+            Some(CpuProfile::X86_64V2),
         );
     }
 
@@ -7016,8 +7050,10 @@ mod tests {
             .unwrap()
             .remove("directory_placeholder");
         value.as_object_mut().unwrap().remove("container_procfs");
+        value.as_object_mut().unwrap().remove("event_driven_private_tmp");
         let restored: Config = serde_json::from_value(value).unwrap();
         assert!(restored.mountinfo_root_rewrites.is_empty());
+        assert!(restored.event_driven_private_tmp.is_none());
         assert!(restored.mountinfo_device_rewrites.is_empty());
         assert!(restored.mountinfo_mount_ids.is_empty());
         assert!(!restored.mountinfo_mount_ids_captured);

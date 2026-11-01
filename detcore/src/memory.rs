@@ -54,6 +54,11 @@ impl SharedMapping {
 pub(crate) struct MemoryMetadata {
     next_anonymous_sequence: u64,
     shared_mappings: BTreeMap<usize, SharedMapping>,
+    /// Threads share this map. Metadata snapshots share each lease; only a
+    /// real fork creates new leases. Dropping the final mm releases them.
+    #[serde(skip)]
+    pub(crate) sysv_attachments:
+        BTreeMap<usize, std::sync::Arc<crate::syscalls::sysv_shm::Attachment>>,
     /// The guest's program break when it was first observed, i.e. the base of
     /// the brk heap.
     #[serde(default)]
@@ -109,6 +114,20 @@ impl MemoryMetadata {
     /// Create an empty address-space model.
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn fork(&self, pid: i32, now: i64) -> Self {
+        let mut child = self.clone();
+        for attachment in child.sysv_attachments.values_mut() {
+            *attachment = attachment.fork(pid, now);
+        }
+        child
+    }
+
+    pub(crate) fn sysv_context(&self, pid: i32, now: i64) {
+        for attachment in self.sysv_attachments.values() {
+            attachment.context(pid, now);
+        }
     }
 
     /// Inspect the actual replacement model without erasing old observations.
@@ -398,6 +417,24 @@ mod tests {
 
     fn mm(tid: i32) -> MmId {
         MmId::initial(DetTid::from_raw(tid))
+    }
+
+    #[test]
+    fn sysv_aliases_and_fork_share_futex_identity_but_detach_does_not() {
+        let mut parent = MemoryMetadata::new();
+        let object = SharedMemoryObjectId::SysV { id: 1 };
+        parent.map_object(0x1000, 4096, object, 0);
+        parent.map_object(0x9000, 4096, object, 0);
+        let child = parent.fork(11, 100);
+        let key = parent.futex_id(mm(10), 0x1010);
+        assert_eq!(key, parent.futex_id(mm(10), 0x9010));
+        assert_eq!(key, child.futex_id(mm(11), 0x1010));
+        assert_eq!(key, child.futex_id(mm(11), 0x9010));
+        parent.unmap(0x1000, 4096);
+        assert_ne!(key, parent.futex_id(mm(10), 0x1010));
+        assert_eq!(key, parent.futex_id(mm(10), 0x9010));
+        parent.map_object(0x1000, 4096, SharedMemoryObjectId::SysV { id: 2 }, 0);
+        assert_ne!(key, parent.futex_id(mm(10), 0x1010));
     }
 
     #[test]

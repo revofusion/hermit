@@ -214,6 +214,9 @@ impl From<TimerFailure> for ProtocolFailure {
 #[derive(Clone, Debug)]
 enum SavedMembership {
     Timed(LogicalTime),
+    /// A signal continuation cancels subscriptions. Returning always probes
+    /// again: its handler may have changed readiness while custody was held.
+    Dependency,
     Queued(SuspendedRunQueueEntry),
     ChildWait { parent: DetPid, spec: ChildWaitSpec },
 }
@@ -1342,6 +1345,9 @@ impl Scheduler {
         }
         if let Some(deadline) = self.blocked.timed_waiters.thread_deadline(tid) {
             self.blocked.timed_waiters.remove(tid);
+            if self.io_dependencies.as_mut().is_some_and(|dependencies| dependencies.cancel(tid)) {
+                return SavedMembership::Dependency;
+            }
             return SavedMembership::Timed(deadline);
         }
         let priority = self.get_priority(tid);
@@ -1696,6 +1702,12 @@ impl Scheduler {
                 SavedMembership::Timed(deadline) => {
                     self.run_queue.remove_tid(tid);
                     self.blocked.timed_waiters.insert(deadline, tid);
+                }
+                SavedMembership::Dependency => {
+                    self.blocked.timed_waiters.remove(tid);
+                    if !self.run_queue.contains_tid(tid) {
+                        self.runqueue_push_back(tid);
+                    }
                 }
                 SavedMembership::Queued(entry) => {
                     let priority = self.get_priority(tid);

@@ -36,6 +36,7 @@ mod io;
 pub(crate) mod memory;
 mod misc;
 mod namespace;
+pub(crate) mod sysv_shm;
 pub(crate) use namespace::anonymous_object_devices;
 pub(crate) use namespace::guest_task_procfs;
 pub(crate) mod binder;

@@ -36,6 +36,10 @@ impl Scheduler {
     /// or `--virtual-timeout`.
     /// In-memory only; no recording carries it.
     pub(crate) fn record_committed_fatal_signal(&mut self, process: DetPid) {
+        if self.io_dependencies.is_some() {
+            info!(target: "detcore::event_driven_io", "event-driven IO authority revoked: fatal signal");
+        }
+        self.event_driven_io(crate::event_driven_io::Update::RevokeAll);
         self.fatal_signal_doomed.insert(process);
     }
 

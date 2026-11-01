@@ -1222,13 +1222,44 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(0)
     }
 
-    /// getresuid under Hermit. Detcore presents a fixed virtual-root identity, so
-    /// the real, effective, and saved user IDs are all the constant 0. Under the
-    /// ptrace backend the guest runs inside a CLONE_NEWUSER namespace that already
-    /// maps the host uid to 0; emulating the same constant here makes in-process
-    /// backends (DBT) agree with that golden reference instead of leaking the host
-    /// uid, and the fully emulated result is bitwise-identical across --verify and
-    /// record/replay.
+    /// Credential setters do not change the fixed guest identity or the host.
+    /// Non-root guests can request their existing IDs, but cannot acquire a
+    /// different identity through a successful no-op.
+    pub(crate) fn handle_fixed_identity_change(
+        &self,
+        call: reverie::syscalls::Syscall,
+    ) -> Result<i64, Error> {
+        let (number, args) = reverie::syscalls::SyscallInfo::into_parts(call);
+        if number == Sysno::setfsuid {
+            return Ok(i64::from(self.cfg.virtual_uid));
+        }
+        if number == Sysno::setfsgid {
+            return Ok(i64::from(self.cfg.virtual_gid));
+        }
+        if self.cfg.virtual_uid == 0 {
+            return Ok(0);
+        }
+        let (id, count, sentinel) = match number {
+            Sysno::setuid => (self.cfg.virtual_uid, 1, false),
+            Sysno::setgid => (self.cfg.virtual_gid, 1, false),
+            Sysno::setreuid => (self.cfg.virtual_uid, 2, true),
+            Sysno::setregid => (self.cfg.virtual_gid, 2, true),
+            Sysno::setresuid => (self.cfg.virtual_uid, 3, true),
+            Sysno::setresgid => (self.cfg.virtual_gid, 3, true),
+            Sysno::setgroups => return Err(Errno::EPERM.into()),
+            _ => return Err(Errno::ENOSYS.into()),
+        };
+        if [args.arg0, args.arg1, args.arg2][..count]
+            .iter()
+            .all(|value| *value as u32 == id || (sentinel && *value as u32 == u32::MAX))
+        {
+            Ok(0)
+        } else {
+            Err(Errno::EPERM.into())
+        }
+    }
+
+    /// Report the configured fixed real, effective and saved user identity.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#1549)
     pub async fn handle_getresuid<G: Guest<Self>>(
@@ -1237,21 +1268,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Getresuid,
     ) -> Result<i64, Error> {
         if let Some(ruid) = call.ruid() {
-            guest.memory().write_value(ruid, &0)?;
+            guest.memory().write_value(ruid, &self.cfg.virtual_uid)?;
         }
         if let Some(euid) = call.euid() {
-            guest.memory().write_value(euid, &0)?;
+            guest.memory().write_value(euid, &self.cfg.virtual_uid)?;
         }
         if let Some(suid) = call.suid() {
-            guest.memory().write_value(suid, &0)?;
+            guest.memory().write_value(suid, &self.cfg.virtual_uid)?;
         }
         Ok(0)
     }
 
-    /// getresgid under Hermit. The group-ID counterpart of `handle_getresuid`:
-    /// the real, effective, and saved group IDs are all the fixed virtual-root
-    /// constant 0, matching the ptrace CLONE_NEWUSER identity and deterministic
-    /// across --verify and record/replay.
+    /// Report the configured fixed real, effective and saved group identity.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#1549)
     pub async fn handle_getresgid<G: Guest<Self>>(
@@ -1260,13 +1288,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Getresgid,
     ) -> Result<i64, Error> {
         if let Some(rgid) = call.rgid() {
-            guest.memory().write_value(rgid, &0)?;
+            guest.memory().write_value(rgid, &self.cfg.virtual_gid)?;
         }
         if let Some(egid) = call.egid() {
-            guest.memory().write_value(egid, &0)?;
+            guest.memory().write_value(egid, &self.cfg.virtual_gid)?;
         }
         if let Some(sgid) = call.sgid() {
-            guest.memory().write_value(sgid, &0)?;
+            guest.memory().write_value(sgid, &self.cfg.virtual_gid)?;
         }
         Ok(0)
     }

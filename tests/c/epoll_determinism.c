@@ -8,7 +8,9 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -21,6 +23,7 @@
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/timerfd.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define ARRAY_SIZE(values) (sizeof(values) / sizeof((values)[0]))
@@ -475,11 +478,166 @@ static void run_dupfd(void) {
   printf("dupfd ops-ok\n");
 }
 
+/* A nonleader exit_group must release the entire group's shared file table
+ * before another process observes socket EOF. Waiting only for the initiating
+ * thread makes the epoll retry count depend on which sibling exits last. */
+static pthread_barrier_t exit_barrier;
+
+static void* exit_tcp_thread(void* argument) {
+  const int result = pthread_barrier_wait(&exit_barrier);
+  if (result != 0 && result != PTHREAD_BARRIER_SERIAL_THREAD) {
+    fail("pthread_barrier_wait");
+  }
+  if ((uintptr_t)argument == 0) {
+    syscall(SYS_exit_group, 0);
+    _exit(99);
+  }
+  for (;;) {
+    pause();
+  }
+  return NULL;
+}
+
+static void run_tcp_exit(bool retain_alias) {
+  sigset_t blocked, previous;
+  sigemptyset(&blocked);
+  sigaddset(&blocked, SIGCHLD);
+  if (sigprocmask(SIG_BLOCK, &blocked, &previous) != 0) {
+    fail_errno("block SIGCHLD");
+  }
+  for (unsigned round = 0; round < 8; ++round) {
+    int listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (listener < 0) {
+      fail_errno("socket listener");
+    }
+    struct sockaddr_in address = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+    };
+    socklen_t length = sizeof(address);
+    if (bind(listener, (struct sockaddr*)&address, length) != 0 ||
+        listen(listener, 2) != 0 ||
+        getsockname(listener, (struct sockaddr*)&address, &length) != 0) {
+      fail_errno("listen on loopback");
+    }
+    int clients[2], servers[2];
+    for (unsigned i = 0; i < 2; ++i) {
+      clients[i] = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+      if (clients[i] < 0 ||
+          connect(clients[i], (struct sockaddr*)&address, length) != 0) {
+        fail_errno("connect loopback");
+      }
+      servers[i] = accept4(listener, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
+      if (servers[i] < 0) {
+        fail_errno("accept loopback");
+      }
+    }
+    close(listener);
+    const int retained = retain_alias ? dup(clients[0]) : -1;
+    if (retain_alias && retained < 0) {
+      fail_errno("dup surviving socket");
+    }
+    int epoll_fd = create_epoll();
+    for (unsigned i = 0; i < 2; ++i) {
+      control_fd(epoll_fd, EPOLL_CTL_ADD, servers[i], EPOLLIN | EPOLLRDHUP, i);
+    }
+    const int epoll_alias = dup(epoll_fd);
+    if (epoll_alias < 0) {
+      fail_errno("dup epoll");
+    }
+    close(epoll_fd);
+    epoll_fd = epoll_alias;
+
+    const pid_t child = fork();
+    if (child < 0) {
+      fail_errno("fork");
+    }
+    if (child == 0) {
+      close(epoll_fd);
+      if (retained >= 0) {
+        close(retained);
+      }
+      for (unsigned i = 0; i < 2; ++i) {
+        close(servers[i]);
+        /* The final close is implicit, including these descriptor aliases. */
+        if (dup(clients[i]) < 0) {
+          fail_errno("dup exiting socket");
+        }
+      }
+      enum { THREADS = 8 };
+      pthread_t threads[THREADS];
+      if (pthread_barrier_init(&exit_barrier, NULL, THREADS) != 0) {
+        fail("pthread_barrier_init");
+      }
+      for (uintptr_t i = 0; i < THREADS; ++i) {
+        if (pthread_create(&threads[i], NULL, exit_tcp_thread, (void*)i) != 0) {
+          fail("pthread_create");
+        }
+      }
+      pthread_join(threads[0], NULL);
+      _exit(98);
+    }
+    close(clients[0]);
+    close(clients[1]);
+    struct epoll_event events[2];
+    const int count = epoll_wait(epoll_fd, events, 2, -1);
+    if (count != (retain_alias ? 1 : 2)) {
+      fail("exit_group exposed partial socket cleanup");
+    }
+    unsigned seen = 0;
+    for (int i = 0; i < count; ++i) {
+      const unsigned tag = events[i].data.u32;
+      if (tag >= 2 || (seen & (1u << tag)) != 0 ||
+          (retain_alias && tag != 1) || !(events[i].events & EPOLLIN)) {
+        fail("unexpected exit readiness");
+      }
+      seen |= 1u << tag;
+      /* Consume the ordered readiness result, not a sorted presentation. */
+      printf("tcp-exit round=%u event=%d socket=%u flags=%x\n",
+             round, i, tag, events[i].events);
+      char byte;
+      if (recv(servers[tag], &byte, 1, 0) != 0) {
+        fail("exited peer did not produce EOF");
+      }
+      control_fd(epoll_fd, EPOLL_CTL_DEL, servers[tag], 0, 0);
+    }
+    int status;
+    if (waitpid(child, &status, 0) != child ||
+        !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+      fail("exit_group child status");
+    }
+    if (retain_alias) {
+      expect_no_events(epoll_fd, "surviving socket reference");
+      write_byte(retained, 'x');
+      if (epoll_wait(epoll_fd, events, 2, -1) != 1 ||
+          events[0].data.u32 != 0) {
+        fail("surviving socket lost readiness");
+      }
+      char byte;
+      read_exact(servers[0], &byte, 1);
+      if (byte != 'x') {
+        fail("surviving socket lost data");
+      }
+      close(retained);
+      if (epoll_wait(epoll_fd, events, 2, -1) != 1 ||
+          events[0].data.u32 != 0 || recv(servers[0], &byte, 1, 0) != 0) {
+        fail("final alias close did not produce EOF");
+      }
+    }
+    close(servers[0]);
+    close(servers[1]);
+    close(epoll_fd);
+  }
+  if (sigprocmask(SIG_SETMASK, &previous, NULL) != 0) {
+    fail_errno("restore SIGCHLD");
+  }
+}
+
 int main(int argc, char** argv) {
   if (argc != 2) {
     fprintf(
         stderr,
-        "usage: %s <multi|edge|oneshot|mixed|nested|control-fds|dupfd>\n",
+        "usage: %s <multi|edge|oneshot|mixed|nested|control-fds|dupfd|tcp-exit|tcp-exit-alias>\n",
         argv[0]);
     return 2;
   }
@@ -498,6 +656,10 @@ int main(int argc, char** argv) {
     run_control_fds();
   } else if (strcmp(argv[1], "dupfd") == 0) {
     run_dupfd();
+  } else if (strcmp(argv[1], "tcp-exit") == 0) {
+    run_tcp_exit(false);
+  } else if (strcmp(argv[1], "tcp-exit-alias") == 0) {
+    run_tcp_exit(true);
   } else {
     fprintf(stderr, "unknown scenario: %s\n", argv[1]);
     return 2;

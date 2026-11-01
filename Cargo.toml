@@ -150,3 +150,22 @@ opt-level = 0
 # https://github.com/rrnewton/hermit/issues/3462
 [profile.validate.package.iced-x86]
 overflow-checks = false
+
+# SysV shared memory uses the owned-backing interface in the checked-out Reverie.
+# Keep its types unified across every backend and the tool's direct dependencies.
+[patch."https://github.com/rrnewton/reverie.git"]
+reverie-core = { path = "reverie/reverie" }
+reverie-process = { path = "reverie/reverie-process" }
+reverie-syscalls = { path = "reverie/reverie-syscalls" }
+reverie-memory = { path = "reverie/reverie-memory" }
+reverie-rpc-transport = { path = "reverie/reverie-rpc-transport" }
+reverie-kvm = { path = "reverie/reverie-kvm" }
+reverie-kvm-core = { path = "reverie/reverie-kvm-core" }
+reverie-linuxemu = { path = "reverie/reverie-linuxemu" }
+reverie-ptrace = { path = "reverie/reverie-ptrace" }
+safeptrace = { path = "reverie/safeptrace" }
+reverie-inguest = { path = "reverie/reverie-inguest" }
+reverie-loader = { path = "reverie/reverie-loader" }
+reverie-dbt = { path = "reverie/reverie-dbt" }
+reverie-liteinst = { path = "reverie/reverie-liteinst" }
+reverie-liteinst-artifact = { path = "reverie/reverie-liteinst-artifact" }

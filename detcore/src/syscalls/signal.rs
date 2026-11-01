@@ -43,10 +43,13 @@ use crate::scheduler::pid_namespaces::GuestPidAnswer;
 use crate::scheduler::process_signal_receiver::ProcessSignalReceiver;
 use crate::scheduler::signal_lists::KernelSiginfo;
 use crate::syscalls::guest_siginfo::GuestSiginfo;
+use crate::syscalls::helpers::KernelSignalWait;
 use crate::syscalls::helpers::REAL_TIME_SIGNALS;
 use crate::syscalls::helpers::act_on_pending_real_time;
 use crate::syscalls::helpers::observe_under_mask;
 use crate::syscalls::helpers::pending_real_time_among;
+use crate::syscalls::helpers::refuse_held_signal_loss;
+use crate::syscalls::helpers::result_after_restore;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::syscalls::helpers::unblocked_by;
 use crate::syscalls::threads::KERNEL_SIGSET_SIZE;
@@ -62,6 +65,8 @@ use crate::tool_global::host_timed_signals;
 use crate::tool_global::names_a_retired_exited_leader;
 use crate::tool_global::notify_signal_pending;
 use crate::tool_global::own_process_signal_inputs;
+use crate::tool_global::process_group;
+use crate::tool_global::process_group_members;
 use crate::tool_global::record_host_timed_signals;
 use crate::tool_global::refuse_sigalrm;
 use crate::tool_global::register_alarm;
@@ -70,6 +75,7 @@ use crate::tool_global::reserve_sigkill;
 use crate::tool_global::reserve_sigkill_group;
 use crate::tool_global::resolve_kill_targets_and_exit;
 use crate::tool_global::resource_request;
+use crate::tool_global::restrict_sigkill_processes;
 use crate::tool_global::set_sigchld_disposition;
 use crate::tool_global::set_sigtimedwait_set;
 use crate::tool_global::sigalrm_refuses;
@@ -813,16 +819,6 @@ fn deterministic_kill_target(
         [target, ..] if sig == 0 => Ok(Some(*target)),
         _ => Err(Errno::ENOSYS),
     }
-}
-
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-1119): Review unmaskable process-group SIGKILL forwarding.
-fn can_forward_process_group_signal(
-    pid: libc::pid_t,
-    sig: libc::c_int,
-    backend_requires_pid_translation: bool,
-) -> bool {
-    pid < -1 && sig == libc::SIGKILL && !backend_requires_pid_translation
 }
 
 /// Whether one of Linux's three ordinary signal syscalls names the calling
@@ -2276,20 +2272,14 @@ impl<T: RecordOrReplay> Detcore<T> {
     // TODO-HUMAN-REVIEW(#663)
     // TODO-HUMAN-REVIEW(PR-1058): Review process-pending signal preservation.
     // TODO-HUMAN-REVIEW(PR-1119): Review unmaskable process-group SIGKILL forwarding.
-    /// Resolve signal-zero existence checks in the fixed PID namespace, then route an
-    /// unambiguous positive-PID process signal through the backend. Backends that can execute
-    /// with guest PIDs preserve process-directed delivery; DBT translates it to the sole live
-    /// thread because its native process uses a host PID. An unmaskable SIGKILL to a specific
-    /// process group is also safe to preserve on backends whose guests use real namespace PIDs;
-    /// other process-group and broadcast delivery remains refused until Detcore models eligible
-    /// signal masks.
+    /// Resolve positive-PID signals and modeled process-group sends without
+    /// forwarding a host process group, which can contain Hermit itself.
     pub async fn handle_kill<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Kill,
     ) -> Result<i64, Error> {
-        // A group send (pid 0 or below) is not a target here: the paths below
-        // refuse it (`refuse_group_signal`) unless it is a SIGKILL.
+        // Group sends preflight these checks for each modeled member below.
         if let Some(refused) = self
             .refuse_reserved_signal_send(
                 guest,
@@ -2351,6 +2341,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .refuse_group_signal(guest, call.pid(), call.sig())
                 .await;
         }
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        if !nested && (call.pid() == 0 || call.pid() < -1) && call.pid() != libc::pid_t::MIN {
+            return self.send_process_group_signal(guest, call).await;
+        }
         let (named, own_init_caught) = if call.pid() > 0 {
             match self.name_guest_pid(guest, Sysno::kill, call.pid()).await {
                 NamedGuestPid::Task {
@@ -2404,37 +2398,6 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await
         {
             return Ok(0);
-        }
-        if can_forward_process_group_signal(
-            tgid,
-            call.sig(),
-            guest
-                .config()
-                .backend
-                .requires_thread_directed_process_signals,
-        ) {
-            // The scheduler is not told about each killed process, but it must
-            // know the group was killed: a held process in it will die, so a
-            // wait for it is not part of a deadlock
-            // (https://github.com/rrnewton/hermit/issues/3904). Told before
-            // the kill, inside this committed turn: the sender may be in the
-            // group and die before the call returns. A kill that then fails
-            // only suppresses a deadlock report, which is the safe direction.
-            // `kill(INT_MIN)` names no group; Linux refuses it with ESRCH.
-            let group = tgid.checked_neg().map(DetPid::from_raw);
-            if group.is_some() {
-                crate::tool_global::notify_unresolved_sigkill(guest, group).await;
-            }
-            // Every member is retired at this turn
-            // (https://github.com/rrnewton/hermit/issues/3994).
-            if guest.config().sequentialize_threads
-                && let Some(group) = group
-                && let Some(reservation) = reserve_sigkill_group(guest, group).await
-            {
-                return self.send_reserved_sigkill(guest, reservation, call).await;
-            }
-            crate::reserved_input::before_signal_send(guest, call.sig(), false)?;
-            return Ok(self.record_or_replay(guest, call).await?);
         }
         if tgid <= 0 {
             return self.refuse_group_signal(guest, tgid, call.sig()).await;
@@ -2521,6 +2484,57 @@ impl<T: RecordOrReplay> Detcore<T> {
                 return Ok(0);
             }
         };
+        // Keep the native SI_USER/shared-queue send, but pin its authenticated
+        // dequeue where the native reservation agrees with Linux's receiver.
+        // A named nonleader must never be replaced by the reservation's
+        // leader/sole-eligible-thread heuristic.
+        tracing::debug!(
+            sender = ?guest.thread_state().dettid, process, signal = call.sig(),
+            ptrace = (guest.config().backend == reverie::BackendCapabilities::PTRACE),
+            record_replay = self.cfg.recordreplay_modes,
+            schedule_replay = self.cfg.replay_schedule_from.is_some(),
+            stacktrace_signal = self.cfg.stacktrace_signal.is_some(),
+            posthook_anchors = guest.thread_state().stats.hb_pending_posthook.len(),
+            "process_signal_preflight_input"
+        );
+        if process != self.detpid.as_raw()
+            && guest.config().backend == reverie::BackendCapabilities::PTRACE
+            && !self.cfg.recordreplay_modes
+            && self.cfg.replay_schedule_from.is_none()
+            && self.cfg.stacktrace_signal.is_none()
+            && OWN_PROCESS_SIGNALS.contains(&call.sig())
+            && guest.thread_state().stats.hb_pending_posthook.is_empty()
+            && let Some(recipient) = crate::tool_global::reserve_process_signal(
+                guest,
+                DetPid::from_raw(process),
+                call.sig(),
+            )
+            .await
+        {
+            if recipient == tid {
+                let result = self
+                    .send_guest_signal(
+                        guest,
+                        call,
+                        recipient,
+                        call.sig(),
+                        Some(DetPid::from_raw(process)),
+                        false,
+                        named,
+                        false,
+                    )
+                    .await;
+                if result.is_ok() && matches!(target, ProcessSignalTarget::Chosen(_)) {
+                    crate::tool_global::process_signal_sent(guest, DetPid::from_raw(process)).await;
+                }
+                crate::tool_global::finish_process_signal(guest, result.is_ok()).await;
+                if result.is_ok() {
+                    self.end_timeslice(guest).await;
+                }
+                return result;
+            }
+            crate::tool_global::finish_process_signal(guest, false).await;
+        }
         let value = if !guest
             .config()
             .backend
@@ -2611,23 +2625,351 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/4046)
-    /// Refuse by name a `kill` to a process group (`pid` 0 for the caller's own,
-    /// `-pgid` for another) or to every process it may signal (`pid` -1).
+    // TODO-HUMAN-REVIEW(pending-local-review): Review modeled group fanout and cohort retirement.
+    /// Snapshot only modeled processes, admit every recipient, then send in
+    /// PID order with the caller last. A default-fatal or stopping self-send
+    /// must not prevent delivery to the remaining members. Each physical send
+    /// remains kill(positive_pid): SI_USER and the shared process-pending queue
+    /// are preserved, and neither the tracer nor an untracked host task can be
+    /// reached through an inherited process group.
+    async fn send_process_group_signal<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Kill,
+    ) -> Result<i64, Error> {
+        if !(0..=libc::SIGRTMAX()).contains(&call.sig()) {
+            return Err(Errno::EINVAL.into());
+        }
+        let group = if call.pid() == 0 {
+            process_group(guest, self.detpid)
+                .await
+                .ok_or(Errno::ESRCH)?
+        } else {
+            DetPid::from_raw(-call.pid())
+        };
+        let mut members = process_group_members(guest, group).await;
+        if members.is_empty() {
+            return Err(Errno::ESRCH.into());
+        }
+        // All modeled guest processes share credentials: credential setters
+        // are deterministic no-ops. Zombies still satisfy existence checks.
+        if call.sig() == 0 {
+            return Ok(0);
+        }
+        // Preserve the process-control backend's existing singleton-group
+        // SIGKILL support. This is exactly a positive self-kill, including a
+        // multithreaded sender: reserve its Exit before the nonreturning send.
+        // A second modeled member still requires unsupported cross-process
+        // transport, so it must never reach this terminal reservation.
+        if guest.config().backend.provides_process_signal_control
+            && call.sig() == libc::SIGKILL
+            && members.as_slice() == [self.detpid]
+            && self
+                .reserve_controlled_self_sigkill_exit(guest, call.sig(), Some(self.detpid), None)
+                .await
+        {
+            return Ok(self
+                .record_or_replay_signal_send(guest, call.with_pid(self.detpid.as_raw()).into())
+                .await?);
+        }
+        // These backends cannot preserve a native process queue and SI_USER,
+        // or cannot admit cross-process delivery before executing the send.
+        if guest
+            .config()
+            .backend
+            .requires_thread_directed_process_signals
+            || guest.config().backend.provides_process_signal_control
+        {
+            return self
+                .refuse_group_signal(guest, call.pid(), call.sig())
+                .await;
+        }
+        // Membership is already sorted; move just the sender to the end.
+        if let Some(index) = members.iter().position(|process| *process == self.detpid) {
+            members[index..].rotate_left(1);
+        }
+        let mut admitted = Vec::with_capacity(members.len());
+        for process in members {
+            let pid = process.as_raw();
+            if let Some(refused) = self
+                .refuse_reserved_signal_send(
+                    guest,
+                    Sysno::kill,
+                    call.sig(),
+                    ReservedSendTarget::Process(pid),
+                    ReservedSendSiginfo::None,
+                )
+                .await
+            {
+                return refused;
+            }
+            if let Some(refused) = self
+                .refuse_stop_signal_send(
+                    guest,
+                    Sysno::kill,
+                    call.sig(),
+                    ReservedSendTarget::Process(pid),
+                    ReservedSendSiginfo::None,
+                )
+                .await
+            {
+                return refused;
+            }
+            if call.sig() == libc::SIGALRM {
+                refuse_sigalrm(guest, SigalrmControl::SendTo(DetTid::from_raw(pid))).await?;
+            }
+            let recipient = if call.sig() == libc::SIGKILL {
+                // SIGKILL has no receiving-thread ambiguity. All live threads
+                // are covered by the single cohort reservation below.
+                let (targets, zombie) = resolve_kill_targets_and_exit(guest, process).await;
+                match targets.first() {
+                    Some(tid) => GroupSignalRecipient::Thread { tid: *tid, chosen: false },
+                    None if zombie == Some(true) => GroupSignalRecipient::Zombie,
+                    None => return Err(Errno::ESRCH.into()),
+                }
+            } else {
+                match self
+                    .own_process_signal(guest, Sysno::kill, pid, pid, call.sig())
+                    .await?
+                {
+                    OwnProcessSend::Admitted => GroupSignalRecipient::Own,
+                    OwnProcessSend::Refused(answer) => return answer,
+                    OwnProcessSend::NotOwn => {
+                        let target = self
+                            .process_signal_target(
+                                guest, Sysno::kill, process, DetTid::from_raw(pid), call.sig(),
+                            )
+                            .await?;
+                        let tid = match target {
+                            ProcessSignalTarget::Thread(tid) | ProcessSignalTarget::Chosen(tid) => Some(tid),
+                            ProcessSignalTarget::SharedQueue => Some(DetTid::from_raw(pid)),
+                            ProcessSignalTarget::Zombie => None,
+                        };
+                        if let Some(tid) = tid
+                            && let Some(refused) = self
+                                .refuse_kernel_run_target_send(
+                                    guest,
+                                    call.with_pid(pid).into(),
+                                    tid,
+                                    DetTid::from_raw(pid),
+                                    call.sig(),
+                                )
+                                .await
+                        {
+                            return refused;
+                        }
+                        match target {
+                            ProcessSignalTarget::Thread(tid) => GroupSignalRecipient::Thread { tid, chosen: false },
+                            ProcessSignalTarget::Chosen(tid) => GroupSignalRecipient::Thread { tid, chosen: true },
+                            ProcessSignalTarget::SharedQueue => GroupSignalRecipient::SharedQueue,
+                            ProcessSignalTarget::Zombie => GroupSignalRecipient::Zombie,
+                        }
+                    }
+                }
+            };
+            admitted.push((process, recipient));
+        }
+        if call.sig() == libc::SIGKILL
+            && admitted
+                .iter()
+                .any(|(_, recipient)| !matches!(recipient, GroupSignalRecipient::Zombie))
+        {
+            return self
+                .send_process_group_sigkill(guest, call, group, &admitted)
+                .await;
+        }
+        let mut succeeded = false;
+        let mut error = None;
+        for (process, recipient) in admitted {
+            let targeted = call.with_pid(process.as_raw());
+            let result = match recipient {
+                GroupSignalRecipient::Zombie => Ok(0),
+                GroupSignalRecipient::Own => {
+                    self.forward_own_process_signal(
+                        guest,
+                        call.sig(),
+                        targeted,
+                        DetTid::from_raw(process.as_raw()),
+                    )
+                    .await
+                }
+                GroupSignalRecipient::SharedQueue => {
+                    self.send_admitted_guest_signal(
+                        guest,
+                        targeted.into(),
+                        DetTid::from_raw(process.as_raw()),
+                        call.sig(),
+                        Some(process),
+                        false,
+                        DetTid::from_raw(process.as_raw()),
+                        false,
+                    ).await
+                }
+                GroupSignalRecipient::Thread { tid, chosen } => {
+                    let result = self
+                        .send_admitted_guest_signal(
+                            guest,
+                            targeted.into(),
+                            tid,
+                            call.sig(),
+                            Some(process),
+                            false,
+                            DetTid::from_raw(process.as_raw()),
+                            false,
+                        )
+                        .await;
+                    if result.is_ok() {
+                        if chosen {
+                            crate::tool_global::process_signal_sent(guest, process).await;
+                        }
+                        self.notify_cross_task_signal(
+                            guest,
+                            tid,
+                            call.sig(),
+                            Some(process),
+                            crate::tool_global::SignalScope::Process,
+                        )
+                        .await;
+                    }
+                    result
+                }
+            };
+            match result {
+                Ok(_) => succeeded = true,
+                Err(Error::Errno(errno)) => error = Some(Error::Errno(errno)),
+                Err(error) => return Err(error),
+            }
+        }
+        if succeeded {
+            Ok(0)
+        } else {
+            Err(error.unwrap_or_else(|| Errno::ESRCH.into()))
+        }
+    }
+
+    /// A native group kill is one nonblocking syscall. Keep its notifications
+    /// in the kernel's queues while the emulation sends to individual members
+    /// and waits for their exit publications. Otherwise the first SIGCHLD can
+    /// enter the backend's held slot and bypass scheduler admission when the
+    /// next child's notification is pending.
+    async fn send_process_group_sigkill<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Kill,
+        group: DetPid,
+        admitted: &[(DetPid, GroupSignalRecipient)],
+    ) -> Result<i64, Error> {
+        if !guest.config().backend.reports_kernel_child_exit_signals {
+            return self
+                .send_process_group_sigkill_cohort(guest, call, group, admitted)
+                .await;
+        }
+        let mut mask = KernelSignalWait::new(guest, 0, false, Errno::ERESTARTSYS);
+        let host_timed = host_timed_signals(guest).await;
+        if !mask.block_in_place(guest, host_timed).await? {
+            // No sends or reservations have happened. Do not fall back to
+            // host-timed delivery when the backend cannot preserve the mask.
+            return self
+                .refuse_group_signal(guest, call.pid(), call.sig())
+                .await;
+        }
+        crate::tool_global::set_saved_guest_sigmask(guest, mask.effective_mask()).await;
+        let result = self
+            .send_process_group_sigkill_cohort(guest, call, group, admitted)
+            .await;
+        let restored = mask.restore(guest, None).await;
+        crate::tool_global::set_saved_guest_sigmask(guest, None).await;
+        match result_after_restore(restored, result) {
+            Ok(result) => refuse_held_signal_loss(guest, Sysno::kill, result).await,
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Keep one reservation across the entire physical fanout. In particular,
+    /// retiring each process separately would let a doomed subreaper adopt
+    /// another victim's children. Failed sends are removed before the single
+    /// cohort commit, rather than falsely retiring tasks the kernel did not kill.
+    async fn send_process_group_sigkill_cohort<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Kill,
+        group: DetPid,
+        admitted: &[(DetPid, GroupSignalRecipient)],
+    ) -> Result<i64, Error> {
+        let Some(reservation) = reserve_sigkill_group(guest, group).await else {
+            // No host-group fallback: reservation failures must precede every
+            // physical send, including backend and namespace-init limitations.
+            return self
+                .refuse_group_signal(guest, call.pid(), call.sig())
+                .await;
+        };
+        let mut successful = Vec::with_capacity(admitted.len());
+        let mut succeeded = false;
+        let mut error = None;
+        for &(process, recipient) in admitted {
+            if matches!(recipient, GroupSignalRecipient::Zombie) {
+                succeeded = true;
+                continue;
+            }
+            if reservation.includes_sender && process == self.detpid {
+                continue;
+            }
+            match self
+                .record_or_replay_signal_send(guest, call.with_pid(process.as_raw()).into())
+                .await
+            {
+                Ok(_) => {
+                    successful.push(process);
+                    succeeded = true;
+                }
+                Err(errno) => error = Some(errno),
+            }
+        }
+        if reservation.includes_sender {
+            successful.push(self.detpid);
+        }
+        let reservation = restrict_sigkill_processes(guest, reservation.token, successful).await?;
+        if reservation.includes_sender {
+            // This grants the sender's Exit, commits the whole successful
+            // cohort, then injects only the sender's positive-PID kill.
+            return self
+                .send_reserved_sigkill(guest, reservation, call.with_pid(self.detpid.as_raw()))
+                .await;
+        }
+        commit_sigkill(guest, reservation.token, true).await;
+        if succeeded {
+            Ok(0)
+        } else {
+            Err(error.unwrap_or(Errno::ESRCH).into())
+        }
+    }
+
+    /// Complete a nonblocking signal send without losing its reserved bookkeeping.
     ///
-    /// Linux sends the signal to each process in the set
-    /// (`__kill_pgrp_info`, `kill_something_info` in kernel/signal.c), and each
-    /// process then picks its receiving thread as a process-directed signal
-    /// does. Detcore models neither the set's membership nor that choice, so
-    /// the call goes through the unsupported-operation policy: a fail-closed
-    /// run stops with the policy-refusal status and
-    /// `--allow-unsupported-syscalls` returns ENOSYS, as the call did before.
-    /// A SIGKILL to another group is forwarded before this point
-    /// (`can_forward_process_group_signal`) when threads are sequentialized,
-    /// except on a backend that needs thread-directed process signals (DBT),
-    /// where it is refused here too. Without sequentialization every such kill
-    /// is refused here, for host safety: the guest's process group is
-    /// inherited from Hermit's (https://github.com/rrnewton/hermit/issues/4057).
+    /// A signal can stop an injection before its syscall instruction executes;
+    /// the backend reports that as ERESTARTSYS. Signal-send syscalls do not
+    /// block or return that restart code themselves. Retry only that unsent
+    /// operation: restarting a whole fanout would resend earlier recipients,
+    /// while treating it as a failed recipient silently loses the signal.
+    /// Genuine send errors still reach the caller unchanged.
+    async fn record_or_replay_signal_send<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Syscall,
+    ) -> Result<i64, Errno> {
+        loop {
+            match self.record_or_replay(guest, call).await {
+                Err(Errno::ERESTARTSYS) => continue,
+                result => return result,
+            }
+        }
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/4046)
+    /// Refuse a broadcast or a group send outside the modeled native transport.
+    /// Fail-closed runs stop; permissive runs receive ENOSYS. In particular,
+    /// non-sequentialized sends must never reach the inherited host group.
     async fn refuse_group_signal<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2640,8 +2982,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             pid => format!("process group {}", pid.unsigned_abs()),
         };
         let reason = if guest.config().sequentialize_threads {
-            "Detcore does not model process-group membership or each process's receiving \
-             thread (https://github.com/rrnewton/hermit/issues/4046)"
+            "broadcast, nested-namespace, or backend process-group delivery is not modeled \
+             safely (https://github.com/rrnewton/hermit/issues/4046)"
         } else {
             "with threads not sequentialized (--no-sequentialize-threads, --strace-only) it \
              would go to the host kernel as is, and the guest's process group is inherited from \
@@ -2784,12 +3126,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         let siginfo = sent_siginfo(guest, &call, sig);
         guest.thread_state_mut().own_signal_turn_hold = Some(sig);
         crate::reserved_input::before_signal_send(guest, sig, false)?;
-        let result = self.record_or_replay(guest, call).await;
+        let result = self.record_or_replay_signal_send(guest, call).await;
         if result.is_err() {
             guest.thread_state_mut().own_signal_turn_hold = None;
         } else {
             self.discard_sent(guest, token, siginfo).await;
             crate::tool_global::process_signal_sent(guest, self.detpid).await;
+            self.publish_sent_signal(guest, QueueId::Process(self.detpid), sig)
+                .await;
         }
         Ok(result?)
     }
@@ -2812,9 +3156,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         let token = self.discard_pre_send(guest, named, queue, sig).await;
         let call: syscalls::Syscall = call.into();
         let siginfo = sent_siginfo(guest, &call, sig);
-        let result = self.record_or_replay(guest, call).await;
+        let result = self.record_or_replay_signal_send(guest, call).await;
         if result.is_ok() {
             self.discard_sent(guest, token, siginfo).await;
+            self.publish_sent_signal(guest, queue, sig).await;
         }
         Ok(result?)
     }
@@ -3507,7 +3852,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         if !reservation.includes_sender {
             self.record_sigkill_robust_lists(guest, reservation.token)
                 .await;
-            let result = self.record_or_replay(guest, call).await;
+            let result = self.record_or_replay_signal_send(guest, call.into()).await;
             commit_sigkill(guest, reservation.token, result.is_ok()).await;
             return Ok(result?);
         }
@@ -3543,7 +3888,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         // threads, a table only it holds goes, with what the queues of its
         // sockets held, just before the send (`Self::release_table_at_exit`).
         self.release_table_at_exit(guest, true).await;
-        Ok(self.record_or_replay(guest, call).await?)
+        Ok(self
+            .record_or_replay_signal_send(guest, call.into())
+            .await?)
     }
 
     /// Send a guest's signal with `syscall`, first recording, for a `SIGCHLD`,
@@ -3579,17 +3926,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         G: Guest<Self>,
         S: Into<reverie::syscalls::Syscall>,
     {
-        use crate::scheduler::child_exit_sigchld::ChildExitSigchldAnswer;
-        use crate::scheduler::child_exit_sigchld::ChildExitSigchldControl;
         let syscall: syscalls::Syscall = syscall.into();
-        // Whether the physical send names one thread, so its copy joins that
-        // thread's private queue: the call does, or the backend must name a
-        // thread for every process signal.
-        let to_one_thread = thread_directed
-            || guest
-                .config()
-                .backend
-                .requires_thread_directed_process_signals;
         // D44 asks about the thread the send reaches: for a thread-directed
         // send the one it names, as the scheduler numbers it (`named`, which
         // the handlers translate from a nested PID namespace's id; `target`
@@ -3602,6 +3939,42 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return refused;
         }
+        self.send_admitted_guest_signal(
+            guest,
+            syscall,
+            target,
+            raw_signal,
+            target_process,
+            thread_directed,
+            named,
+            terminal_covered,
+        )
+        .await
+    }
+
+    /// Send after recipient policy admission. Group fanout admits its entire
+    /// snapshot before entering this path; do not introduce late refusals here.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the same send facts as send_guest_signal"
+    )]
+    async fn send_admitted_guest_signal<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: syscalls::Syscall,
+        target: DetTid,
+        raw_signal: i32,
+        target_process: Option<DetPid>,
+        thread_directed: bool,
+        named: DetTid,
+        terminal_covered: bool,
+    ) -> Result<i64, Error> {
+        use crate::scheduler::child_exit_sigchld::ChildExitSigchldAnswer;
+        use crate::scheduler::child_exit_sigchld::ChildExitSigchldControl;
+        // The physical destination decides whether the copy joins one
+        // thread's private queue or the process's shared queue.
+        let to_one_thread = thread_directed
+            || guest.config().backend.requires_thread_directed_process_signals;
         let mut undo = None;
         if raw_signal == libc::SIGCHLD && guest.config().sequentialize_threads {
             // Without a process, or sent to one thread, the copy joins the
@@ -3641,7 +4014,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let token = self.discard_pre_send(guest, named, queue, raw_signal).await;
         let siginfo = sent_siginfo(guest, &syscall, raw_signal);
         crate::reserved_input::before_signal_send(guest, raw_signal, terminal_covered)?;
-        let result = self.record_or_replay(guest, syscall).await;
+        let result = self.record_or_replay_signal_send(guest, syscall).await;
         if result.is_err()
             && let Some(undo) = undo
         {
@@ -3649,8 +4022,30 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         if result.is_ok() {
             self.discard_sent(guest, token, siginfo).await;
+            self.publish_sent_signal(guest, queue, raw_signal).await;
         }
         Ok(result?)
+    }
+
+    /// A successful physical enqueue is a readiness change, not an interrupt.
+    /// In particular a self-send or a blocked signal can ready another thread's
+    /// signalfd without satisfying `notify_signal_pending`'s EINTR policy.
+    async fn publish_sent_signal<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        queue: QueueId,
+        signal: i32,
+    ) {
+        if guest.config().event_driven_io && signal != 0 {
+            crate::tool_global::event_driven_io(
+                guest,
+                crate::event_driven_io::Update::SignalChange {
+                    queue,
+                    signals: kernel_sigset_bit(signal),
+                },
+            )
+            .await;
+        }
     }
 
     /// A5 step 3c.1c, design D44(b): under the in-guest delivery gate, refuse a
@@ -6022,6 +6417,18 @@ pub(crate) enum ProcessSignalTarget {
     SharedQueue,
 }
 
+#[derive(Clone, Copy)]
+enum GroupSignalRecipient {
+    /// A waitable zombie accepts a signal without a physical send.
+    Zombie,
+    /// The existing own-process admission requires the sender's turn hold.
+    Own,
+    /// The receiving thread, retaining whether Linux's curr_target must advance.
+    Thread { tid: DetTid, chosen: bool },
+    /// A process-shared queue with no newly selected receiving thread.
+    SharedQueue,
+}
+
 enum OwnProcessSend {
     /// The ordinary path decides: the call does not name the sender's own
     /// multi-threaded process, or the schedule does not force the kernel's
@@ -6811,15 +7218,6 @@ mod tests {
                 first,
             ));
         }
-    }
-
-    #[test]
-    fn process_group_forwarding_is_limited_to_unmaskable_sigkill() {
-        assert!(can_forward_process_group_signal(-42, libc::SIGKILL, false));
-        assert!(!can_forward_process_group_signal(-42, libc::SIGTERM, false));
-        assert!(!can_forward_process_group_signal(0, libc::SIGKILL, false));
-        assert!(!can_forward_process_group_signal(-1, libc::SIGKILL, false));
-        assert!(!can_forward_process_group_signal(-42, libc::SIGKILL, true));
     }
 
     #[test]

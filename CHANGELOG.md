@@ -6,6 +6,160 @@ branches from 0.5.0.
 
 ## 0.5.3 (Unreleased)
 
+- Integrate upstream Hermit `94cafc22b1ead` and Reverie baseline
+  `bca5399182da`, retaining run-local shared memory, event-driven readiness and
+  authenticated process-signal dequeue reservations. Forward shared-backing
+  capabilities and local state through upstream's `NativeOperationGuest`, so
+  supported SysV calls do not incorrectly return `ENOSYS`. Global RPC revision
+  23 rejects older, incompatible scheduler messages before decoding them.
+  Preserve upstream Linux receiver selection and process-pending group delivery;
+  separately queued thread signals keep their own sender identity and lifetime.
+  OCI workdir binds cannot claim custody of Hermit's generated private `/tmp`.
+- Support scheduler-owned blocking `flock` under `--event-driven-io` on
+  native ptrace for regular files in the authenticated private `/tmp` mount
+  on supported local filesystems. Kernel nonblocking probes remain authoritative;
+  a retained native OFD survives close/reuse of the original fd number.
+  Unlock, conversion, close, exit and traced descriptor-transfer transitions
+  wake indexed waiters without periodic polling. Preserve shared/exclusive
+  exclusion, Linux's non-atomic conversions, interruption and restart.
+  Retire lock domains with their last live description/wait so native inode reuse
+  cannot change logical lock identities across repeats.
+  Native probes reuse the original fd only after exact `KCMP_FILE` validation;
+  otherwise a transient imported alias preserves custody and guest lock-owner PID.
+  Unproved external producers and unsupported backends remain fail-closed.
+  Losing SCM_RIGHTS accounting revokes lock-wait authority and wakes waiters
+  into refusal, including bounded-queue eviction and unmatched delivery.
+  Managed-lock fdinfo uses the existing structured renderer instead of the legacy
+  empty-file sanitizer; unsupported native process-lock/lease attribution is refused.
+  The Reverie submodule now points to the revofusion fork.
+- Add `hermit run --event-driven-io`, an explicit scheduling/time policy for
+  sequential native ptrace runs with isolated local networking. After an empty
+  probe, tracked eventfd/anonymous-pipe waits, scheduler-owned signalfd waits,
+  owned Unix-stream socket waits, and epoll graphs containing only tracked
+  sources park until a dependency changes, a signal interrupts, or the
+  original virtual deadline expires. Open-file identities, generation-checked
+  registration and indexed subscribers prevent fd reuse and missed wakeups;
+  Linux still supplies readiness, bytes and epoll edge/oneshot results.
+  Idle deadline jumps wait for unresolved external completions. This policy can
+  change schedules and timestamps relative to physical polling; it is refused
+  with legacy schedule recording/replay, passthrough interception, host
+  networking, in-guest signal delivery and unsupported backends.
+  Unix socket authority requires traced OFDs and abstract names or physically
+  resolved paths beneath the launch-authenticated private `/tmp`; shared mounts,
+  symlinks, descriptor exports and unproved producers retain conservative fallback.
+  Unused TCP listeners can park only until an ingress-capable operation revokes
+  their authority before execution. This is not a TCP simulator: active TCP,
+  other unowned sockets and timerfds retain physical probes.
+  Read-only route-interface dumps, traced INET UDP traffic, proven regular-file
+  copies and ordinary local socket options no longer revoke unrelated stream
+  authority. Passive MPTCP listeners share TCP's no-ingress restriction.
+  Passing traced anonymous pipes or managed flock files across a proven traced
+  Unix stream channel does not revoke every socket; pipe sources still lose
+  authority, while flock transitions keep their per-file dependency. Other
+  descriptor transfers close socket authority and unknown exports also withdraw
+  flock authority. Proven tool-owned fdinfo reads used for received-descriptor
+  lock accounting no longer masquerade as unowned socket operations.
+  Netlink mutations, unproven ancillary data and Unix datagrams still fall back.
+  Signalfd subscriptions follow the observer's private/process queues and the
+  exact shared mask; mask replacement preserves dup/fork identities and flags.
+  Epoll signalfd watches require the original ADD task/process/address space.
+  Unowned signal producers, SIGCHLD, kernel/terminal signals, POSIX timer masks
+  and background reads retain conservative fallback. Blocked signal sends wake
+  readiness probes without manufacturing EINTR or signal records.
+  Masked/select-family waits and specialized pipe-write waits retain
+  their existing paths. Native signal-provenance restrictions remain: a
+  process-shared or host-timed SIGCHLD cannot decide a gated wait merely
+  because it appears pending in the kernel. Authenticated native exec/exit
+  boundaries preserve source authority and queue re-probes behind the existing
+  physical-completion barriers; failed exec preserves surviving descriptors.
+  Unknown lifecycle boundaries and uncertain kernel mutations revoke affected
+  authority; unprovable descriptor-table/transfer lifetimes can disable parking.
+  Generic nonblocking/CLOEXEC flag ioctls and terminal queries on positively
+  identified null/zero/full devices preserve dependency authority.
+  INFO counters and first-attempt fallback diagnostics under
+  `detcore::event_driven_io` report registrations, wakes and coverage; positive
+  idle-time jumps report their exact nanosecond delta at INFO level.
+  Verification records, PMU preemption and syscall validation are not relaxed.
+- Add opt-in internal `read`/`readv`/`poll` wait diagnostics with
+  `RUST_LOG=detcore::wait_probe=debug`. Begin/probe/end records include the
+  deterministic thread, retry index, helper-level probe result and would-block
+  classification, descriptor identity/type, and poll event masks. `end` reports
+  the retry-loop result before signal restoration; the existing syscall-finish
+  record remains authoritative for the guest result. Poll snapshots are bounded
+  to 1,024 entries, with truncation and unreadable memory explicitly reported.
+  Logging adds no injections, clock observations, or scheduling decisions;
+  disabled diagnostics perform no descriptor lookup or guest-memory read.
+  Broad DEBUG/TRACE filters also enable it; force it off with
+  `RUST_LOG=detcore::wait_probe=off`. Detailed logging adds host overhead and is
+  not a wall-time profiler.
+- Do not give non-chaos `vfork` children a permanent priority boost after
+  exec. The existing vfork barrier still enforces child-first execution until
+  exec/exit, but a CPU-busy new image no longer starves its parent or unrelated
+  normal-priority services. Chaos and replay priority selection are unchanged.
+- Keep debug clock-invariant validation independent without rescanning every
+  historical thread on every update. An exact reduction tree validates thread
+  updates in logarithmic time and scheduler-only updates in constant time;
+  exec and deserialization rebuild it from the unchanged canonical maps.
+  Logical time, saturating arithmetic, and serialized clock formats are unchanged.
+- Honor per-call `MSG_DONTWAIT` for all six socket send/receive APIs, even
+  when the descriptor is logically blocking. Return the kernel's `EAGAIN`
+  instead of retrying indefinitely, without changing shared descriptor flags.
+- Do not accumulate wall-clock backoff while skipped grants are making
+  deterministic scheduler progress. Groups of blocked pollers previously paid
+  exponential sleeps while being requeued, before their next probes could run.
+  Such transitions still yield; genuinely stalled passes retain timed backoff.
+  Queue ordering, logical-time charges and verification records are unchanged.
+- Reserve a native cross-process caught signal's recipient through its actual
+  dequeue before allowing other guest turns. An eligible leader, or a sole
+  eligible sibling, may now receive `kill` while parked in restartable internal
+  IO polling, native `epoll_wait` (which retains `EINTR`, even with
+  `SA_RESTART`), or an expired CPU slice. Slice returns retain native signal
+  dequeue and do not synthesize a syscall interruption. A recorded parent-death
+  `SIGKILL` source no longer prevents unrelated caught-signal delivery: it cannot
+  run a handler or coalesce with that signal, and its source remains tracked.
+  Other host-timed sources still exclude reservations. The original kernel call
+  retains `SI_USER`, sender identity and the process-shared queue.
+  Conflicting pending copies, signal waiters/signalfds, unproven private masks,
+  unstable tasks and unsupported backends cannot use this stronger reservation.
+  Supported calls can instead use upstream's checked native receiver selection;
+  calls with competing kernel sigwait/signalfd consumers still refuse.
+  Plain native epoll's own private mask is admitted only with explicit guard
+  provenance, a matching kernel mask and verified restoration before dequeue.
+  A copy consumed during restoration retains the reservation through ptrace's
+  captured siginfo custody; the final callback must match the send ledger's
+  `SI_USER`, sender process and native UID before its delivery grant releases
+  peers. Unreported delivery and missing/mismatched custody fail closed, and
+  guest temporary-mask calls remain excluded from this reservation. Global RPC
+  revision 22 requires the combined upstream receiver-selection and local
+  reservation, guard and custody protocol.
+- Hold ptrace peer scheduling through a process's complete exit, including
+  implicit socket closure by the last exiting thread, regardless of the
+  parent's SIGCHLD disposition. Epoll consumers no longer race a nonleader's
+  `exit_group` cleanup; descriptor references retained by other processes
+  continue to work.
+- Consume ignored SIGCHLD notifications without scheduling a signal-delivery
+  turn. A parent reaping children can now progress while unrelated services
+  remain runnable; caught signals and blocked signal waits retain their
+  notification and siginfo semantics.
+- Retry signal injections interrupted before execution without resending earlier
+  process-group recipients. Group SIGKILL no longer leaves multithreaded
+  descendants alive after a partially completed fanout.
+- Keep a ptrace group-kill sender's child notifications queued through the
+  cohort commit and exit-publication fence, then restore its guest signal mask.
+  Caught notifications no longer bypass scheduler admission, and ignored
+  notifications are classified using the sender's original mask.
+- Select deterministic source ports for native IPv4/IPv6 TCP and UDP `connect`
+  using Linux's `IP_LOCAL_PORT_RANGE`, restoring the guest's per-socket range
+  before yielding. Both endpoints observe the real selected address; explicit
+  binds, invalid-call behavior, narrow user ranges and UDP disconnects retain
+  native semantics. Client allocation advances past closed TCP ports and releases
+  disconnected UDP reservations. Kernels without the required socket option are
+  refused rather than falling back to randomized source ports.
+- Advance the global RPC revision for process-group queries, restricted SIGKILL
+  reservations and client-port allocation, so incompatible runtimes and
+  coordinators refuse each other before decoding messages.
+- Include `patches/ssp-route-hints-count.patch` for SSP's existing zero-hint
+  setting: disabled hints no longer require managed regtest routing nodes.
 - Read the calling process's `/proc/.../cmdline` from its current argument
   memory on ptrace and KVM, including rewritten arguments, thread aliases and
   positioned reads. Reading another process's command line remains a KVM gap.

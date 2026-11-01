@@ -497,7 +497,7 @@ impl StartOpts {
         &self,
         network: NetworkingMode,
     ) -> Result<(Container, IdentityGuard), Error> {
-        let mut container = namespace_container(true, None);
+        let mut container = namespace_container(true, None, (0, 0));
         network.configure(&mut container, false);
         let (mut identity_mounts, mut identity_guard) = identity_hardening_mounts(None)?;
         for mount in &self.mount {

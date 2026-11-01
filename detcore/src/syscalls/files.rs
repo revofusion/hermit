@@ -5944,6 +5944,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let host_stat = self
                     .add_fd_with_stat(guest, fd, call.flags(), fd_type)
                     .await?;
+                // A reopened pipe has a new OFD and no authenticated channel
+                // provenance. It may retain or mutate an existing anonymous
+                // pipe, so do not leave any prior dependency wait parked.
+                if self.cfg.event_driven_io
+                    && (fd_type == FdType::Pipe
+                        || host_stat.as_ref().is_some_and(|stat| stat.st_mode & libc::S_IFMT == libc::S_IFIFO))
+                {
+                    tracing::info!(target: "detcore::event_driven_io", "event-driven IO authority revoked: reopened pipe");
+                    crate::tool_global::event_driven_io(
+                        guest, crate::event_driven_io::Update::RevokeAll,
+                    ).await;
+                }
                 // Linux names a random device by its device number, whatever
                 // path reached it (a literal or relative name, `.` or `..`, a
                 // symbolic link, `/proc/self/fd/N`, a bind mount, a copy of
@@ -6804,7 +6816,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// why those work. The guest's descriptor is a real host descriptor, so the
     /// kernel supplies the whole contract for free and consistently with itself:
     /// shared vs exclusive, `LOCK_NB`, upgrade/downgrade (which Linux performs
-    /// non-atomically -- see below, this handler compensates), release on
+    /// non-atomically -- see the blocking/refusal paths below), release on
     /// `LOCK_UN`, release when the last descriptor for the open file
     /// description is closed, and release on process exit.
     ///
@@ -6834,8 +6846,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// deterministic scheduler as blocked, so nothing runs to release the lock
     /// and the whole container wedges -- measured: a four-way contention guest
     /// that completes natively hung indefinitely under a plain forwarding
-    /// implementation. So a blocking operation is rewritten to `LOCK_NB` and,
-    /// if it turns out to be contended, refused rather than hung.
+    /// implementation. A blocking operation is therefore probed with `LOCK_NB`.
+    /// Under `--event-driven-io`, eligible private regular files retain their
+    /// entry OFD and park on scheduler-owned dependencies. Other files and
+    /// backends retain the fail-closed path described below.
     ///
     /// That rewrite is not free, and the cost is a *lock the guest already
     /// owns*. Linux converts an `flock` lock in place and the conversion is not
@@ -6847,8 +6861,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Under the rewrite it would: the guest asked to wait, got told "no", and
     /// silently lost the shared lock it was already relying on.
     ///
-    /// So this handler restores the prior mode before refusing a *blocking*
-    /// conversion, making the refusal side-effect-free. It deliberately does
+    /// Outside that proven domain, restore the prior mode before refusing a
+    /// *blocking* conversion, making the refusal side-effect-free. Deliberately
     /// **not** restore when the guest itself passed `LOCK_NB`: there the drop is
     /// exactly what Linux does, and re-acquiring would be a divergence in the
     /// other direction. `DetFd::flock_mode` is what makes the two cases
@@ -6868,6 +6882,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Flock,
     ) -> Result<i64, Error> {
+        if let Some(mut wait) = crate::flock::Wait::prepare(guest, call).await? {
+            if call.operation() & (libc::LOCK_NB | libc::LOCK_UN) != 0 {
+                return wait.attempt(guest, call.operation()).await;
+            }
+            return super::helpers::retry_flock(guest, call, wait).await;
+        }
         // A flock belongs to its open file description. Whatever the call
         // did (took, converted, released, or, refused, dropped a lock in a
         // non-atomic conversion), the description's own fdinfo now says which
@@ -7042,16 +7062,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                         }
                     }
                 }
-                // Waiting faithfully needs a wait queue owned by the
-                // deterministic scheduler, the way futexes are handled; until
-                // that exists, refuse loudly. Returning success would recreate
-                // the mutual-exclusion bug this handler was written to fix, and
-                // blocking in the kernel would deadlock the container.
+                // This file has no proven closed set of lock producers.
+                // Never grant another owner's lock or block the scheduler
+                // inside the kernel; eligible private files use the wait path.
                 report_flock_refusal(&format!(
                     "[dtid {dettid}] blocking flock(fd={fd}, operation={operation:#x}) is \
-                     contended, and Detcore cannot yet park a thread on a file lock \
-                     deterministically. Refusing rather than granting a lock another guest \
-                     holds. {FLOCK_REFUSAL_ADVICE}"
+                     contended outside its proven scheduler-owned file-lock domain. \
+                     Refusing rather than granting a lock another guest holds. \
+                     {FLOCK_REFUSAL_ADVICE}"
                 ));
                 self.refuse_unserviceable_operation(guest, Sysno::flock, Errno::ENOLCK)
                     .await
@@ -7154,7 +7172,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             .and_then(AddrMut::<u8>::from_raw)
             .ok_or(Errno::EFAULT)?;
         let result = self
-            .drain_procfs(guest, call, mapping, CAPTURE_CHUNK_BYTES, lists_locks)
+            .drain_procfs(guest, call, mapping, CAPTURE_CHUNK_BYTES, lists_locks, false)
             .await;
         guest
             .inject_with_retry(Syscall::Munmap(
@@ -7198,7 +7216,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 && let Ok(guard) = stack.commit()
             {
                 let result = self
-                    .drain_procfs(guest, call, scratch, CAPTURE_CHUNK_BYTES, lists_locks)
+                    .drain_procfs(guest, call, scratch, CAPTURE_CHUNK_BYTES, lists_locks, false)
                     .await;
                 guest.memory().write_exact(scratch, &original)?;
                 drop(guard);
@@ -7211,7 +7229,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             let original = &mut original[..chunk];
             if save_procfs_scratch(&mut guest.memory(), buffer, original) {
                 let result = self
-                    .drain_procfs(guest, call, buffer, chunk, lists_locks)
+                    .drain_procfs(guest, call, buffer, chunk, lists_locks, false)
                     .await;
                 guest.memory().write_exact(buffer, original)?;
                 return result;
@@ -7237,6 +7255,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         scratch: AddrMut<'_, u8>,
         chunk: usize,
         lists_locks: bool,
+        owned_fdinfo: bool,
     ) -> Result<Vec<u8>, Error> {
         const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 
@@ -7244,7 +7263,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut contents = Vec::new();
         let mut reads = Vec::new();
         loop {
-            let bytes_read = self.record_or_replay(guest, capture).await? as usize;
+            let bytes_read = if owned_fdinfo && guest.config().event_driven_io {
+                // read_opened_entry proves this tool-owned fd is a procfs
+                // fdinfo entry in the current serialized turn. It is never
+                // a guest socket source. Keep the physical read, without
+                // treating an intentionally untracked metadata fd as one.
+                guest.inject(capture).await?
+            } else {
+                self.record_or_replay(guest, capture).await?
+            } as usize;
             if bytes_read == 0 {
                 break;
             }
@@ -13144,6 +13171,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 scratch,
                 FDINFO_PAGE - FDINFO_READ,
                 false,
+                true,
             )
             .await
         {
@@ -13925,6 +13953,24 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         }
 
+        // A configured non-root identity must not report a successful change
+        // to another owner/group. The host still validates the unchanged
+        // assignment below, including ownership of the target itself.
+        if self.cfg.virtual_uid != 0 {
+            let (owner, group) = match &call {
+                Syscall::Chown(c) => (c.owner(), c.group()),
+                Syscall::Fchown(c) => (c.owner(), c.group()),
+                Syscall::Fchownat(c) => (c.owner(), c.group()),
+                Syscall::Lchown(c) => (c.owner(), c.group()),
+                _ => unreachable!(),
+            };
+            if (owner != u32::MAX && owner != self.cfg.virtual_uid)
+                || (group != u32::MAX && group != self.cfg.virtual_gid)
+            {
+                return Err(Errno::EPERM.into());
+            }
+        }
+
         // Argument half. `F_GETFL` answers it for `fchown`: it validates the
         // descriptor and distinguishes an `O_PATH` descriptor, which `fstat`
         // accepts and `fchown` rejects. For the three pathname variants a
@@ -14340,8 +14386,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                 self.maybe_set_nonblocking_fd(guest, fds[1]);
             }
             // Both ends name the pipe by the read end's open file description,
-            // for `--pipe-wake-latency` only (`crate::pipe_wake`).
-            if self.cfg.pipe_wake_latency_in_effect().is_some() {
+            // for pipe handoff and dependency subscriptions (`crate::pipe_wake`).
+            if self.cfg.pipe_wake_latency_in_effect().is_some() || self.cfg.event_driven_io {
                 let read_end = guest
                     .thread_state()
                     .with_detfd(fds[0], |detfd| detfd.open_file_id())?;
@@ -14356,6 +14402,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         .thread_state()
                         .with_detfd(fd, |detfd| detfd.set_channel(end))?;
                 }
+                crate::event_driven_io::created(guest, fds[0], false).await;
             }
         }
 
@@ -14710,6 +14757,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             guest
                 .thread_state()
                 .with_detfd(fd, |detfd| detfd.set_guest_created())?;
+            if guest.config().event_driven_io
+                && crate::event_driven_io::created_udp_socket(call.family(), call.r#type(), call.protocol())
+            {
+                guest.thread_state().with_detfd(fd, |file| file.set_udp_socket())?;
+            }
+            crate::event_driven_io::socket_created(
+                guest, fd,
+                crate::event_driven_io::created_socket_domain(call.family(), call.r#type(), call.protocol()),
+                true,
+            ).await;
 
             Ok(fd as i64)
         }
@@ -14843,6 +14900,13 @@ impl<T: RecordOrReplay> Detcore<T> {
 
             self.maybe_set_nonblocking_fd(guest, fds[0]);
             self.maybe_set_nonblocking_fd(guest, fds[1]);
+            for fd in fds {
+                crate::event_driven_io::socket_created(
+                    guest, fd,
+                    crate::event_driven_io::created_socket_domain(call.family(), call.r#type(), call.protocol()),
+                    false,
+                ).await;
+            }
         }
         Ok(res)
     }
@@ -15305,6 +15369,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         if internally_nonblocking {
             self.maybe_set_nonblocking_fd(guest, fd);
         }
+        crate::event_driven_io::created(guest, fd, false).await;
         Ok(fd as i64)
     }
 
@@ -15408,6 +15473,23 @@ impl<T: RecordOrReplay> Detcore<T> {
                     mask: mask & !unblockable,
                 })
             })?;
+        }
+        if self.cfg.event_driven_io {
+            let key = guest.thread_state().with_detfd(signalfd, |fd| {
+                (fd.ty() == FdType::Signalfd)
+                    .then(|| crate::event_driven_io::Key::File(fd.open_file_id()))
+            }).ok().flatten();
+            if let Some(key) = key {
+                // Read the committed kernel mask, not a guest-memory preread.
+                // Provenance comes from creation tracking, never from fdinfo.
+                let mask = signalfd_sigmask(guest.pid().as_raw(), signalfd);
+                crate::tool_global::event_driven_io(
+                    guest,
+                    crate::event_driven_io::Update::Signalfd {
+                        key, mask, create: call.fd() == -1,
+                    },
+                ).await;
+            }
         }
         Ok(signalfd as i64)
     }
@@ -16312,9 +16394,6 @@ impl<T: RecordOrReplay> Detcore<T> {
             FdType::Socket,
         )
         .await?;
-        guest
-            .thread_state()
-            .with_detfd(fd, |detfd| detfd.set_accepted_connection())?;
         let peer = self.note_unix_accept(guest, call.sockfd(), fd, completes_in_turn);
         guest.thread_state().with_detfd(fd, |detfd| {
             detfd.set_accepted_connection();
@@ -16334,6 +16413,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         );
         self.classify_guest_held_peer(guest, fd, guest_created)
             .await;
+        let domain = crate::event_driven_io::socket_domain(guest, call.sockfd());
+        crate::event_driven_io::socket_created(guest, fd, domain, false).await;
 
         if physically_nonblocking {
             self.maybe_set_nonblocking_fd(guest, fd);
@@ -22491,12 +22572,11 @@ mod untraced_code_tests {
     }
 }
 
-/// Closing advice of every flock refusal. It names no backend: LOCK_NB is the
-/// form Detcore can serve wherever the backend supports flock, and ENOLCK
-/// reaches the guest only when the run opted in to unsupported syscalls.
-const FLOCK_REFUSAL_ADVICE: &str = "LOCK_NB is the supported form where the backend \
-     supports flock at all; ENOLCK is returned instead only under \
-     --allow-unsupported-syscalls.";
+/// Unknown ownership retains the native nonblocking/refusal contract.
+const FLOCK_REFUSAL_ADVICE: &str = "Blocking locks require --event-driven-io and \
+     a proven private regular file on native ptrace. Otherwise LOCK_NB is \
+     supported where the backend supports flock; ENOLCK is returned instead \
+     only under --allow-unsupported-syscalls.";
 
 /// Report a flock refusal in every disposition, fail-closed (the run ends)
 /// and opted in (the guest gets ENOLCK): through tracing, and directly on

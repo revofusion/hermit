@@ -331,9 +331,28 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         // What the backend reports that no call reads back. `EBADF`: the
         // descriptor is not open after all, as `seq_show` finds it.
+        let native_flock = self.cfg.event_driven_io
+            && self.cfg.backend == reverie::BackendCapabilities::PTRACE
+            && guest.thread_state().with_detfd(target, |file| {
+                file.flock_domain().is_some_and(|domain| domain.enabled())
+            }).unwrap_or(false);
+        if !self.renders_fdinfo() && !native_flock {
+            // Fdinfo binds a numeric slot, not an OFD: the slot may have been
+            // closed/reused, or its authority revoked, since this file opened.
+            return Err(Self::refuse_fdinfo(
+                guest, target,
+                "the native fdinfo target no longer has managed flock authority".to_owned(),
+            ).await);
+        }
         let status = match guest.descriptor_status(target) {
             Ok(status) => Some(status),
             Err(reverie::FactError::Errno(Errno::EBADF)) => return Err(Errno::ENOENT.into()),
+            Err(reverie::FactError::NotProvided) if native_flock => {
+                return Err(Self::refuse_fdinfo(
+                    guest, target,
+                    "the native lock state cannot be represented without losing lock rows".to_owned(),
+                ).await);
+            }
             Err(reverie::FactError::NotProvided) => None,
             Err(error) => {
                 let reason = format!(
@@ -344,6 +363,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                 return Err(Self::scratch_failure(guest, sysno, reason).await);
             }
         };
+        if native_flock && status.as_ref().is_some_and(|status| {
+            status.locks.iter().any(|lock| !matches!(
+                lock.class, reverie::LockClass::Flock | reverie::LockClass::OpenFileDescription
+            ))
+        }) {
+            return Err(Self::refuse_fdinfo(
+                guest, target,
+                "native process-lock and lease owner attribution is not available".to_owned(),
+            ).await);
+        }
         let placeholder = if model.placeholder {
             Box::pin(self.placeholder_fdinfo(guest, target)).await?
         } else {

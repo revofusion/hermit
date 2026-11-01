@@ -28,6 +28,7 @@ use std::sync::atomic::AtomicI32;
 use std::sync::atomic::Ordering;
 
 use anyhow::anyhow;
+use detcore_model::config::EventDrivenPrivateTmp;
 use detcore_model::config::MountInfoRootRewrite;
 use detcore_model::container_mounts::ContainerMountTable;
 use detcore_model::container_mounts::Installation;
@@ -100,6 +101,8 @@ struct MountInfoRootSource {
     rewrite_descendant_roots: bool,
     raw_mountpoint_prefix: Option<Vec<u8>>,
     deterministic_mountpoint_prefix: Option<Vec<u8>>,
+    /// Set only by `private_tmp`, never by a generic rewrite or user mount.
+    event_driven_private_tmp: bool,
 }
 
 fn open_path(path: &Path) -> io::Result<File> {
@@ -522,11 +525,13 @@ impl MountInfoRootSource {
             rewrite_descendant_roots: false,
             raw_mountpoint_prefix: None,
             deterministic_mountpoint_prefix: None,
+            event_driven_private_tmp: false,
         })
     }
 
     fn private_tmp(source: &Path) -> Result<Self, Error> {
         let mut provenance = Self::new(source, Path::new("/tmp"), DETERMINISTIC_TMP_ROOT)?;
+        provenance.event_driven_private_tmp = true;
         provenance.rewrite_descendant_roots = true;
         provenance.raw_mountpoint_prefix = Some(mountinfo_escape_path(source));
         provenance.deterministic_mountpoint_prefix = Some(b"/tmp".to_vec());
@@ -546,6 +551,7 @@ impl MountInfoRootSource {
             rewrite_descendant_roots: false,
             raw_mountpoint_prefix: Some(mountinfo_escape_path(staging_path)),
             deterministic_mountpoint_prefix: Some(b"/tmp".to_vec()),
+            event_driven_private_tmp: false,
         }
     }
 
@@ -1053,6 +1059,32 @@ impl IdentityGuard {
             .push(overriding_target.to_path_buf());
     }
 
+    /// Mint a readiness capability only from the pinned generated TempDir.
+    /// A user replacement of `/tmp` discards this source; child mounts remain
+    /// visible but are rejected by the runtime's openat2 NO_XDEV resolution.
+    pub(super) fn event_driven_private_tmp(&self) -> Result<Option<EventDrivenPrivateTmp>, Error> {
+        let Some(source) = self.mountinfo_roots.iter().find(|source| source.event_driven_private_tmp)
+        else {
+            return Ok(None);
+        };
+        let target = open_path(&source.target)?;
+        let target_metadata = target.metadata()?;
+        let source_metadata = source.source.as_ref()
+            .ok_or_else(|| anyhow!("private tmp provenance lacks its pinned source"))?
+            .metadata()?;
+        if !target_metadata.is_dir()
+            || (source_metadata.dev(), source_metadata.ino())
+                != (target_metadata.dev(), target_metadata.ino())
+        {
+            anyhow::bail!("private /tmp no longer matches the pinned generated directory");
+        }
+        Ok(Some(EventDrivenPrivateTmp {
+            device: target_metadata.dev(),
+            inode: target_metadata.ino(),
+            raw_mount_id: mount_id_for_fd(target.as_raw_fd())?,
+        }))
+    }
+
     /// Resolve proven source objects to exact mount IDs in the completed guest
     /// namespace.  This runs after all mounts are installed and before the guest
     /// starts, while the namespace is quiescent.  Held source and target
@@ -1495,7 +1527,7 @@ pub(super) fn apply_affinity(
 }
 
 pub fn default_container(pin_threads: bool) -> Container {
-    let mut container = namespace_container(pin_threads, None);
+    let mut container = namespace_container(pin_threads, None, (0, 0));
     container.mount(container_proc_mount());
     container
 }
@@ -1506,11 +1538,13 @@ pub fn default_container(pin_threads: bool) -> Container {
 pub(super) fn namespace_container(
     pin_threads: bool,
     cpu_profile_source: Option<usize>,
+    identity: (u32, u32),
 ) -> Container {
     let mut container = Container::new();
     container
         .unshare(Namespace::PID)
-        .map_root()
+        .map_uid(identity.0, unsafe { libc::geteuid() })
+        .map_gid(identity.1, unsafe { libc::getegid() })
         .hostname("hermetic-container.local")
         .domainname("local")
         // A mount namespace created inside a user namespace starts as a slave
@@ -1546,10 +1580,12 @@ pub(super) fn container_proc_mount() -> Mount {
 /// The CLI enables this for the ptrace and KVM backends. Other backends
 /// have distinct launch/runtime-file requirements and must be qualified before
 /// they can safely share this filesystem setup.
-/// Backend/device and caller-bind choices for [`image_container`].
+/// Backend/device, caller-bind, and guest credential choices for [`image_container`].
 pub(super) struct ImageContainerOpts<'a> {
     pub bind_kvm: bool,
     pub workdir_binds: &'a [(PathBuf, PathBuf)],
+    /// User/group IDs mapped to the launcher's host credentials, not guest PIDs.
+    pub identity: (u32, u32),
 }
 
 pub(super) fn image_container(
@@ -1564,7 +1600,8 @@ pub(super) fn image_container(
     let mut container = Container::new();
     container
         .unshare(Namespace::PID)
-        .map_root()
+        .map_uid(opts.identity.0, unsafe { libc::geteuid() })
+        .map_gid(opts.identity.1, unsafe { libc::getegid() })
         .hostname("hermetic-container.local")
         .domainname("local")
         // As in `default_container`: stop host mount propagation.
@@ -1583,13 +1620,30 @@ pub(super) fn image_container(
     // its read-only remount; the hand-written remount did not, so every image
     // run failed at spawn under such a cache.
     container.mount(Mount::bind(rootfs, rootfs).readonly());
-    container.mount(Mount::bind(tmpfs, rootfs.join("tmp")).rshared());
+    let tmp_mount = Mount::bind(tmpfs, rootfs.join("tmp")).rshared();
+    // Follow the same install-time tree as ordinary mount plans: a caller
+    // bind can cover /tmp through an image symlink or an earlier bind. Even
+    // rebinding the generated directory itself does not confer custody.
+    let mut mount_tree = InstallTimeTree::default();
+    let tmp_mountpoint = if private_tmp && !opts.workdir_binds.is_empty() {
+        mount_tree.install(&tmp_mount).0
+    } else {
+        None
+    };
+    let mut tmp_replaced = false;
+    container.mount(tmp_mount);
     // Caller work directories (--bind HOST:GUEST with --image): bound after
     // the read-only root so the guest can read/write its test workdir while
     // the image itself stays immutable. Targets are guest-absolute paths.
     for (source, target) in opts.workdir_binds {
         let rel = target.strip_prefix("/").unwrap_or(target);
-        container.mount(Mount::bind(source, rootfs.join(rel)));
+        let mount = Mount::bind(source, rootfs.join(rel));
+        if let Some(tmp_mountpoint) = &tmp_mountpoint
+            && let (Some(target), _) = mount_tree.install(&mount)
+        {
+            tmp_replaced |= tmp_mountpoint.starts_with(target);
+        }
+        container.mount(mount);
     }
 
     // Mount the deterministic /proc into the target root. The materializer
@@ -1676,7 +1730,7 @@ pub(super) fn image_container(
 
     apply_affinity(&mut container, pin_threads, cpu_profile_source);
     let mut identity_sources = IdentityGuard::empty();
-    if private_tmp {
+    if private_tmp && !tmp_replaced {
         identity_sources.add_private_tmp(tmpfs)?;
     }
     identity_sources.set_image_root();
@@ -6255,6 +6309,7 @@ mod tests {
                     ImageContainerOpts {
                         bind_kvm: false,
                         workdir_binds: &[],
+                        identity: (0, 0),
                     },
                 )
                 .map_err(|error| error.to_string())?;
@@ -6325,6 +6380,7 @@ mod tests {
                     ImageContainerOpts {
                         bind_kvm: false,
                         workdir_binds: &[],
+                        identity: (0, 0),
                     },
                 )
                 .map_err(|error| error.to_string())?;
@@ -6803,6 +6859,12 @@ mod tests {
         let private_tmp = tempfile::TempDir::new().expect("create private tmp");
         let provenance = MountInfoRootSource::private_tmp(private_tmp.path()).unwrap();
         assert!(provenance.rewrite_descendant_roots);
+        assert!(provenance.event_driven_private_tmp);
+        assert!(!MountInfoRootSource::new(
+            private_tmp.path(), Path::new("/tmp"), DETERMINISTIC_TMP_ROOT,
+        ).unwrap().event_driven_private_tmp);
+        assert!(!MountInfoRootSource::translated_tmp_mountpoint(private_tmp.path())
+            .event_driven_private_tmp);
         assert_eq!(
             provenance.raw_mountpoint_prefix.as_deref(),
             Some(mountinfo_escape_path(private_tmp.path()).as_slice())
@@ -6811,6 +6873,22 @@ mod tests {
             provenance.deterministic_mountpoint_prefix.as_deref(),
             Some(b"/tmp".as_slice())
         );
+    }
+
+    #[test]
+    fn private_tmp_receipt_requires_the_pinned_source_at_the_target() {
+        let source = tempfile::TempDir::new().unwrap();
+        let replacement = tempfile::TempDir::new().unwrap();
+        let mut provenance = MountInfoRootSource::private_tmp(source.path()).unwrap();
+        provenance.target = replacement.path().to_owned();
+        let mut guard = IdentityGuard::empty();
+        guard.mountinfo_roots.push(provenance);
+        assert!(guard.event_driven_private_tmp().is_err());
+        guard.mountinfo_roots.clear();
+        guard.mountinfo_roots.push(MountInfoRootSource::new(
+            source.path(), source.path(), DETERMINISTIC_TMP_ROOT,
+        ).unwrap());
+        assert!(guard.event_driven_private_tmp().unwrap().is_none());
     }
 
     #[test]
@@ -6827,6 +6905,7 @@ mod tests {
             ImageContainerOpts {
                 bind_kvm: false,
                 workdir_binds: &[],
+                identity: (0, 0),
             },
         )
         .expect("construct image container with generated tmp");
@@ -6842,10 +6921,50 @@ mod tests {
             ImageContainerOpts {
                 bind_kvm: false,
                 workdir_binds: &[],
+                identity: (0, 0),
             },
         )
         .expect("construct image container with user tmp");
         assert!(supplied.mountinfo_roots.is_empty());
+    }
+
+    #[test]
+    fn image_binds_cannot_claim_private_tmp_custody() {
+        let rootfs = tempfile::TempDir::new().expect("create image rootfs");
+        let private_tmp = tempfile::TempDir::new().expect("create private tmp");
+        fs::create_dir(rootfs.path().join("tmp")).unwrap();
+        std::os::unix::fs::symlink("tmp", rootfs.path().join("scratch")).unwrap();
+        for (target, owns_tmp) in [
+            ("/tmp", false),
+            ("/tmp/../tmp", false),
+            ("/scratch", false),
+            ("/", false),
+            ("/tmp/child", true),
+            ("/work", true),
+        ] {
+            // The same source inode is intentional: inode equality alone
+            // must not turn a caller's replacement into a private mount.
+            let binds = [(private_tmp.path().to_path_buf(), PathBuf::from(target))];
+            let (_, guard) = image_container(
+                rootfs.path(),
+                private_tmp.path(),
+                false,
+                None,
+                true,
+                true,
+                ImageContainerOpts {
+                    bind_kvm: false,
+                    workdir_binds: &binds,
+                    identity: (1234, 5678),
+                },
+            )
+            .expect("construct image container with caller bind");
+            assert_eq!(
+                guard.mountinfo_roots.iter().any(|source| source.event_driven_private_tmp),
+                owns_tmp,
+                "{target}",
+            );
+        }
     }
 
     #[test]
@@ -6920,6 +7039,7 @@ mod tests {
             rewrite_descendant_roots: false,
             raw_mountpoint_prefix: None,
             deterministic_mountpoint_prefix: None,
+            event_driven_private_tmp: false,
         });
         let mut mounts = vec![Mount::bind("/tmp", "/run/nscd")];
 
@@ -6938,6 +7058,7 @@ mod tests {
                 rewrite_descendant_roots: false,
                 raw_mountpoint_prefix: None,
                 deterministic_mountpoint_prefix: None,
+                event_driven_private_tmp: false,
             });
             let mut mounts = vec![Mount::bind("/tmp", "/run/nscd")];
             guard.discard_mounts_shadowed_by(&mut mounts, Path::new(direct_target));

@@ -78,6 +78,8 @@ pub enum SharedMemoryObjectId {
     },
     /// Open-file-description fallback used when inode metadata is unavailable.
     OpenFile { id: OpenFileId },
+    /// Run-owned System V segment; IDs are never reused within a run.
+    SysV { id: u32 },
 }
 
 /// Identity of a futex word.

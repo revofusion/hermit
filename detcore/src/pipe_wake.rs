@@ -29,8 +29,9 @@
 //!
 //! Every input is guest state read in committed turns, so the hand-offs
 //! happen at the same turns in every run and in a replay made with the same
-//! option. With the option unset none of this runs: no poll names a channel,
-//! no description carries one, and no RPC is sent.
+//! option. `--event-driven-io` also uses channel identities and committed
+//! mutation reports, but indexes parked subscriptions instead of scanning the
+//! runnable pollers. With both options unset, no channel or RPC is added.
 
 use detcore_model::fd::OpenFileId;
 use serde::Deserialize;
@@ -159,14 +160,16 @@ pub(crate) fn progress_of(
 }
 
 impl<T: crate::record_or_replay::RecordOrReplay> crate::Detcore<T> {
-    /// The channel end behind the guest descriptor `fd`, when
-    /// `--pipe-wake-latency` is in effect and Detcore knows it.
+    /// The channel end behind `fd` when either pipe handoff or dependency
+    /// waiting is enabled and Detcore knows its provenance.
     pub(crate) fn pipe_channel_end<G: reverie::Guest<Self>>(
         &self,
         guest: &G,
         fd: std::os::unix::io::RawFd,
     ) -> Option<ChannelEnd> {
-        self.cfg.pipe_wake_latency_in_effect()?;
+        if self.cfg.pipe_wake_latency_in_effect().is_none() && !self.cfg.event_driven_io {
+            return None;
+        }
         guest
             .thread_state()
             .with_detfd(fd, |detfd| detfd.channel())
@@ -184,6 +187,12 @@ impl<T: crate::record_or_replay::RecordOrReplay> crate::Detcore<T> {
         channel: ChannelId,
         wants: Wants,
     ) {
+        if self.cfg.event_driven_io {
+            crate::tool_global::event_driven_io(
+                guest,
+                crate::event_driven_io::Update::Change(vec![crate::event_driven_io::Key::Pipe(channel)]),
+            ).await;
+        }
         let Some(latency) = self.cfg.pipe_wake_latency_in_effect() else {
             return;
         };
@@ -235,15 +244,15 @@ impl<T: crate::record_or_replay::RecordOrReplay> crate::Detcore<T> {
         }
     }
 
-    /// The channel ends among the guest descriptors `first..=last`, in
-    /// descriptor order, when `--pipe-wake-latency` is in effect.
+    /// Known channel ends among `first..=last` in descriptor order, when
+    /// pipe handoff or dependency waiting is enabled.
     pub(crate) fn pipe_channel_ends_in<G: reverie::Guest<Self>>(
         &self,
         guest: &G,
         first: u32,
         last: u32,
     ) -> Vec<ChannelEnd> {
-        if self.cfg.pipe_wake_latency_in_effect().is_none() || first > last {
+        if (self.cfg.pipe_wake_latency_in_effect().is_none() && !self.cfg.event_driven_io) || first > last {
             return Vec::new();
         }
         guest
@@ -257,7 +266,8 @@ impl<T: crate::record_or_replay::RecordOrReplay> crate::Detcore<T> {
 
     /// This thread closed `end` (explicitly: `close`, `close_range`, or a
     /// `dup2` or `dup3` over it): ready what that closing gives the other
-    /// side. An implicit close at exit or exec readies nothing.
+    /// side. Dependency waits separately revoke authority before exit/exec;
+    /// the latency-only policy does not notify on implicit closes.
     pub(crate) async fn note_channel_end_closed<G: reverie::Guest<Self>>(
         &self,
         guest: &mut G,

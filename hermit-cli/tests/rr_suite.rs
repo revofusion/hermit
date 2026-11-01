@@ -580,14 +580,14 @@ rr_test!(rr_shared_monitor, "shared_monitor", 0, &[]);
 rr_test!(rr_shared_offset, "shared_offset", 0, &[]);
 rr_test!(rr_shared_write, "shared_write", 0, &[]);
 rr_test!(
-    #[ignore = "refused by design: SysV shmget is ENOSYS (cell sysv-shm-enosys); https://github.com/rrnewton/hermit/issues/4257"]
+    #[ignore = "requires SHM_REMAP, which remains unsupported; basic SysV lifecycle is covered by sysv_legacy_fallbacks"]
     rr_shm,
     "shm",
     0,
     &[]
 );
 rr_test!(
-    #[ignore = "refused by design: SysV shmget is ENOSYS (cell sysv-shm-enosys); https://github.com/rrnewton/hermit/issues/4257"]
+    #[ignore = "requires partial munmap of an attached SysV segment, which remains unsupported"]
     rr_shm_unmap,
     "shm_unmap",
     0,

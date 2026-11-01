@@ -787,6 +787,98 @@ pub struct GlobalTime {
     /// existed, means the default charge for `multiplier`.
     #[serde(default)]
     scheduler_turn_charge: Option<u64>,
+
+    /// Independent reduction of absolute thread contributions, not a second
+    /// delta accumulator. Private clock mutations refresh the affected leaf;
+    /// scheduler-only mutations leave every leaf unchanged. Snapshots retain
+    /// the canonical maps and rebuild this derived index on the next check.
+    #[cfg(debug_assertions)]
+    #[serde(skip)]
+    validation: Option<ClockValidation>,
+}
+
+/// A balanced reduction keeps debug validation independent of `total` without
+/// rescanning every historical thread on every RPC and scheduler turn.
+///
+/// Each leaf is the canonical local duration minus its inherited baseline.
+/// Every internal node is the saturating sum of its children. Since unsigned
+/// saturating addition is associative, the root equals a full vector reduction,
+/// including at clock exhaustion. Updating a leaf recomputes its ancestors
+/// from both children; it never applies the delta used to update `total`.
+#[cfg(debug_assertions)]
+#[derive(Debug, Clone)]
+struct ClockValidation {
+    slots: HashMap<DetTid, usize>,
+    free_slots: Vec<usize>,
+    // Binary heap layout: root at 1, leaves in the second half.
+    sums: Vec<LogicalTime>,
+}
+
+#[cfg(debug_assertions)]
+impl ClockValidation {
+    fn new(
+        times: &HashMap<DetTid, LogicalTime>,
+        inherited: &HashMap<DetTid, LogicalDuration>,
+    ) -> Self {
+        let capacity = times.len().max(1).next_power_of_two();
+        let mut slots = HashMap::with_capacity(times.len());
+        let mut sums = vec![LogicalTime::ZERO; 2 * capacity];
+        for (slot, (tid, time)) in times.iter().enumerate() {
+            slots.insert(*tid, slot);
+            sums[capacity + slot] = *time - inherited.get(tid).copied().unwrap_or_default();
+        }
+        let mut validation = Self {
+            slots,
+            free_slots: Vec::new(),
+            sums,
+        };
+        validation.reduce();
+        validation
+    }
+
+    fn reduce(&mut self) {
+        for node in (1..self.sums.len() / 2).rev() {
+            self.sums[node] = self.sums[2 * node] + self.sums[2 * node + 1];
+        }
+    }
+
+    fn set(&mut self, tid: DetTid, contribution: LogicalTime) {
+        let slot = if let Some(slot) = self.slots.get(&tid) {
+            *slot
+        } else {
+            let slot = self.free_slots.pop().unwrap_or(self.slots.len());
+            let capacity = self.sums.len() / 2;
+            if slot == capacity {
+                // Move the old leaves, preserving their absolute values.
+                // Growth is geometric; rebuilding costs O(N) only at doubling.
+                self.sums.resize(4 * capacity, LogicalTime::ZERO);
+                self.sums.copy_within(capacity..2 * capacity, 2 * capacity);
+                self.reduce();
+            }
+            self.slots.insert(tid, slot);
+            slot
+        };
+        let mut node = self.sums.len() / 2 + slot;
+        if self.sums[node] == contribution {
+            return;
+        }
+        self.sums[node] = contribution;
+        while node > 1 {
+            node /= 2;
+            self.sums[node] = self.sums[2 * node] + self.sums[2 * node + 1];
+        }
+    }
+
+    fn remove(&mut self, tid: DetTid) {
+        if self.slots.contains_key(&tid) {
+            self.set(tid, LogicalTime::ZERO);
+            self.free_slots.push(self.slots.remove(&tid).unwrap());
+        }
+    }
+
+    fn total(&self) -> LogicalTime {
+        self.sums[1]
+    }
 }
 
 /// A scheduler turn whose configured charge would pass the end of
@@ -830,6 +922,8 @@ impl GlobalTime {
                 cfg.scheduler_turn_charge()
                     .unwrap_or_else(|error| panic!("invalid scheduler turn cost: {error}"))
             }),
+            #[cfg(debug_assertions)]
+            validation: None,
         }
     }
 
@@ -863,6 +957,8 @@ impl GlobalTime {
             // Update the cached total for efficiency:
             let LogicalTime(diff) = newtime - *old;
             *old = newtime;
+            #[cfg(debug_assertions)]
+            self.refresh_validation(tid);
             // Exec may reload fresh local state. Its first response restores
             // the absolute clock, while this existing component retains the
             // original inherited baseline rather than charging that work again.
@@ -874,6 +970,8 @@ impl GlobalTime {
             );
             self.time_vector.insert(tid, newtime);
             self.inherited_time.insert(tid, inherited);
+            #[cfg(debug_assertions)]
+            self.refresh_validation(tid);
             // A child's first startup RPC reports its inherited clock before
             // it has executed guest work. Its arrival must contribute zero,
             // whether it precedes or follows the scheduler's time snapshot.
@@ -881,8 +979,28 @@ impl GlobalTime {
         }
     }
 
-    fn sanity(&self) {
-        debug_assert_eq!(self.sum_up(), self.total);
+    fn sanity(&mut self) {
+        #[cfg(debug_assertions)]
+        {
+            let validation = self.validation.get_or_insert_with(|| {
+                ClockValidation::new(&self.time_vector, &self.inherited_time)
+            });
+            debug_assert_eq!(validation.slots.len(), self.time_vector.len());
+            debug_assert_eq!(
+                self.starting_nanos + validation.total() + self.extra_time,
+                self.total
+            );
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn refresh_validation(&mut self, tid: DetTid) {
+        let contribution = self.time_vector[&tid] - self.inherited_duration(tid);
+        if let Some(validation) = &mut self.validation {
+            validation.set(tid, contribution);
+        }
+        // With no index (new/deserialized clock), sanity builds all leaves
+        // from canonical state after this mutation, independently of its delta.
     }
 
     fn bump_total(&mut self, delta: Duration) {
@@ -891,6 +1009,7 @@ impl GlobalTime {
     }
 
     // The expensive way to get the total (internal)
+    #[cfg(test)]
     fn sum_up(&self) -> LogicalTime {
         let mut sum = self.starting_nanos;
         for (tid, tm) in &self.time_vector {
@@ -983,6 +1102,13 @@ impl GlobalTime {
         let survivor_inherited = self.inherited_time.remove(&from).unwrap_or_default();
         self.time_vector.insert(to, survivor_time);
         self.inherited_time.insert(to, survivor_inherited);
+        #[cfg(debug_assertions)]
+        {
+            // Reassignment changes membership and folds the retired leader's
+            // work into extra_time. Rebuild from canonical maps on this rare
+            // path, rather than retaining dead leaves or trusting old totals.
+            self.validation = None;
+        }
         self.sanity();
     }
 
@@ -994,6 +1120,12 @@ impl GlobalTime {
         let inherited = self.inherited_time.remove(&dtid).unwrap_or_default();
         if let Some(time) = self.time_vector.remove(&dtid) {
             self.extra_time = self.extra_time + (time - inherited);
+        }
+        #[cfg(debug_assertions)]
+        if let Some(validation) = &mut self.validation {
+            // Transfer the contribution to extra_time without a full-vector
+            // rebuild on each exit; later threads reuse the vacant leaf.
+            validation.remove(dtid);
         }
         self.sanity();
     }
@@ -1386,6 +1518,37 @@ mod global_time_tests {
         assert!(!time.contains_thread(worker));
     }
 
+    #[test]
+    fn clock_reduction_reuses_retired_leaves_before_growing() {
+        let mut time = GlobalTime::new(&Config::default());
+        let start = time.as_nanos();
+        for raw in 1..=8 {
+            time.update_global_time(
+                DetTid::from_raw(raw),
+                start + LogicalTime::from_nanos(raw as u64),
+                LogicalTime::ZERO,
+            );
+        }
+        let before = time.as_nanos();
+        for raw in [2, 5, 8] {
+            time.retire_thread(DetTid::from_raw(raw));
+            assert_eq!(time.as_nanos(), before);
+            assert_eq!(time.as_nanos(), time.sum_up());
+        }
+        // Reuse both an old ID and new IDs, then cross the capacity boundary.
+        for raw in [5, 9, 10, 11, 12] {
+            time.update_global_time(
+                DetTid::from_raw(raw),
+                start + LogicalTime::from_nanos(100),
+                LogicalTime::from_nanos(90),
+            );
+            assert_eq!(time.as_nanos(), time.sum_up());
+        }
+        #[cfg(debug_assertions)]
+        assert_eq!(time.validation.as_ref().unwrap().slots.len(), 10);
+        assert_eq!(time.as_nanos(), before + LogicalTime::from_nanos(50));
+    }
+
     /// Linux gives an exited thread's ID to a later thread once IDs wrap at
     /// `pid_max`. The later thread starts at its creator's time with a
     /// component of its own: none of its inherited history is charged, and
@@ -1418,5 +1581,194 @@ mod global_time_tests {
         second_holder.add_syscall_with_cost(7);
         publish(&mut time, reused, &second_holder);
         assert_eq!(time.as_nanos(), start + LogicalTime::from_nanos(1_157));
+    }
+
+    #[test]
+    fn clock_reduction_matches_full_vector_across_growth_and_exec() {
+        let mut time = GlobalTime::new(&Config::default());
+        let start = time.as_nanos();
+        // Cross every tree-capacity boundary through 1024, retaining all
+        // historical clocks even though only a few will publish again.
+        for raw in 1..=1025 {
+            let inherited = LogicalTime::from_nanos(raw as u64 * 3);
+            time.update_global_time(
+                DetTid::from_raw(raw),
+                start + inherited + LogicalTime::from_nanos(raw as u64 % 17),
+                inherited,
+            );
+            assert_eq!(time.as_nanos(), time.sum_up());
+        }
+        for raw in (1..=1025).rev() {
+            let tid = DetTid::from_raw(raw);
+            let next = time.threads_time(tid) + LogicalTime::from_nanos(7);
+            // A reloaded local clock must not overwrite its original baseline.
+            time.update_global_time(tid, next, LogicalTime::ZERO);
+            time.update_global_time(tid, next, LogicalTime::ZERO);
+            time.add_extra_time(Duration::from_nanos(raw as u64));
+            assert_eq!(time.as_nanos(), time.sum_up());
+        }
+        for (from, to) in [(1025, 1), (1024, 2048), (1, 1), (2048, 1)] {
+            let from = DetTid::from_raw(from);
+            let to = DetTid::from_raw(to);
+            let total = time.as_nanos();
+            let survivor = time.threads_time(from);
+            time.reassign_thread(from, to);
+            assert_eq!(time.as_nanos(), total);
+            assert_eq!(time.as_nanos(), time.sum_up());
+            assert_eq!(time.threads_time(to), survivor);
+            time.update_global_time(
+                to,
+                survivor + LogicalTime::from_nanos(11),
+                LogicalTime::ZERO,
+            );
+            assert_eq!(time.as_nanos(), time.sum_up());
+        }
+        let mut cloned = time.clone();
+        cloned.add_extra_time(Duration::from_nanos(13));
+        assert_eq!(cloned.as_nanos(), cloned.sum_up());
+        assert_eq!(time.as_nanos(), time.sum_up());
+    }
+
+    #[test]
+    fn clock_reduction_preserves_saturation_and_retired_work() {
+        let mut time = GlobalTime::default();
+        let first = DetTid::from_raw(1);
+        let second = DetTid::from_raw(2);
+        let half = LogicalTime::from_nanos(u64::MAX / 2 + 1);
+        time.update_global_time(first, half, LogicalTime::ZERO);
+        time.update_global_time(second, half, LogicalTime::ZERO);
+        assert_eq!(time.as_nanos(), LogicalTime::MAX);
+        assert_eq!(time.as_nanos(), time.sum_up());
+        time.reassign_thread(first, second);
+        assert_eq!(time.as_nanos(), LogicalTime::MAX);
+        assert_eq!(time.as_nanos(), time.sum_up());
+        time.update_global_time(second, LogicalTime::MAX, LogicalTime::ZERO);
+        time.add_extra_time(Duration::MAX);
+        assert_eq!(time.as_nanos(), time.sum_up());
+    }
+
+    #[test]
+    fn global_clock_snapshots_rebuild_validation_without_changing_wire_fields() {
+        let mut time = GlobalTime::new(&Config::default());
+        let start = time.as_nanos();
+        let tid = DetTid::from_raw(3);
+        time.update_global_time(
+            tid,
+            start + LogicalTime::from_nanos(100),
+            LogicalTime::from_nanos(70),
+        );
+        let snapshot = serde_json::to_value(&time).unwrap();
+        assert_eq!(snapshot["time_vector"]["3"], serde_json::json!(100));
+        assert_eq!(snapshot["inherited_time"]["3"], serde_json::json!(70));
+        let mut restored: GlobalTime = serde_json::from_value(snapshot).unwrap();
+        #[cfg(debug_assertions)]
+        assert!(restored.validation.is_none());
+        restored.update_global_time(tid, start + LogicalTime::from_nanos(111), LogicalTime::ZERO);
+        assert_eq!(restored.as_nanos(), start + LogicalTime::from_nanos(41));
+        assert_eq!(restored.as_nanos(), restored.sum_up());
+
+        // Match the pre-cache field sequence, including a following RPC value:
+        // serde(skip) must not append a cache tag to unframed binary data.
+        let old_fields = (
+            time.starting_nanos,
+            &time.time_vector,
+            &time.inherited_time,
+            time.extra_time,
+            time.total,
+            time.multiplier,
+            time.scheduler_turn_charge,
+        );
+        let expected =
+            bincode::serde::encode_to_vec((old_fields, 0x1234_5678_u64), bincode::config::legacy())
+                .unwrap();
+        let wire =
+            bincode::serde::encode_to_vec((&time, 0x1234_5678_u64), bincode::config::legacy())
+                .unwrap();
+        assert_eq!(wire, expected);
+        let ((mut restored, following), consumed): ((GlobalTime, u64), usize) =
+            bincode::serde::decode_from_slice(&wire, bincode::config::legacy()).unwrap();
+        assert_eq!(consumed, wire.len());
+        assert_eq!(following, 0x1234_5678);
+        restored.add_extra_time(Duration::from_nanos(1));
+        assert_eq!(restored.as_nanos(), restored.sum_up());
+
+        // Old JSON snapshots omit the inherited map entirely.
+        let mut legacy = serde_json::to_value(&time).unwrap();
+        legacy.as_object_mut().unwrap().remove("inherited_time");
+        legacy["total"] = serde_json::to_value(start + LogicalTime::from_nanos(100)).unwrap();
+        let mut restored: GlobalTime = serde_json::from_value(legacy).unwrap();
+        restored.add_extra_time(Duration::from_nanos(1));
+        restored.update_global_time(tid, start + LogicalTime::from_nanos(111), LogicalTime::ZERO);
+        assert_eq!(restored.as_nanos(), start + LogicalTime::from_nanos(112));
+        assert_eq!(restored.as_nanos(), restored.sum_up());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn clock_validation_detects_incorrect_delta_and_changed_absolute_leaf() {
+        use std::panic::AssertUnwindSafe;
+        use std::panic::catch_unwind;
+
+        let mut time = GlobalTime::default();
+        let tid = DetTid::from_raw(1);
+        time.update_global_time(
+            tid,
+            LogicalTime::from_nanos(30),
+            LogicalTime::from_nanos(20),
+        );
+        let mut wrong_delta = time.clone();
+        // Applying a delta to total without the matching canonical mutation
+        // cannot fool a reduction built from absolute contributions.
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                wrong_delta.bump_total(Duration::from_nanos(1));
+            }))
+            .is_err()
+        );
+        time.time_vector.insert(tid, LogicalTime::from_nanos(31));
+        time.refresh_validation(tid);
+        assert!(catch_unwind(AssertUnwindSafe(|| time.sanity())).is_err());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn clock_validation_detects_inconsistent_deserialized_total() {
+        let mut snapshot = serde_json::to_value(GlobalTime::default()).unwrap();
+        snapshot["total"] = serde_json::json!(1);
+        let mut time: GlobalTime = serde_json::from_value(snapshot).unwrap();
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                time.add_extra_time(Duration::from_nanos(1));
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rejected_clock_updates_leave_canonical_state_unchanged() {
+        use std::panic::AssertUnwindSafe;
+        use std::panic::catch_unwind;
+
+        let mut time = GlobalTime::new(&Config::default());
+        let start = time.as_nanos();
+        let tid = DetTid::from_raw(1);
+        time.update_global_time(tid, start + LogicalTime::from_nanos(10), LogicalTime::ZERO);
+        let before = serde_json::to_value(&time).unwrap();
+        for (thread, local, inherited) in [
+            (tid, start - LogicalTime::from_nanos(1), LogicalTime::ZERO),
+            (tid, start + LogicalTime::from_nanos(9), LogicalTime::ZERO),
+            (DetTid::from_raw(2), start, LogicalTime::from_nanos(1)),
+        ] {
+            assert!(
+                catch_unwind(AssertUnwindSafe(|| {
+                    time.update_global_time(thread, local, inherited);
+                }))
+                .is_err()
+            );
+            assert_eq!(serde_json::to_value(&time).unwrap(), before);
+            assert_eq!(time.as_nanos(), time.sum_up());
+        }
+        time.add_extra_time(Duration::from_nanos(1));
+        assert_eq!(time.as_nanos(), time.sum_up());
     }
 }

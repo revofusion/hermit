@@ -1382,6 +1382,7 @@ impl Scheduler {
                 ))
             }
             DiscardedSignalControl::Sent(token, siginfo) => {
+                self.note_reserved_send_identity(dtid, token, siginfo);
                 let siginfo = siginfo.unwrap_or_else(|| {
                     super::signal_lists::ordinary_siginfo(token.signal, 0, process.as_raw(), 0)
                 });
@@ -1534,6 +1535,7 @@ impl Scheduler {
                 }
             }
             DiscardedSignalControl::Unreported { signal } => {
+                self.refuse_reserved_unreported(signal);
                 DiscardedSignalAnswer::Delivery(self.timer_signal_dequeue(dtid, signal, None))
             }
             DiscardedSignalControl::Handler {

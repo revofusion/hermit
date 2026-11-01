@@ -5,6 +5,7 @@
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
@@ -235,6 +236,75 @@ static void tcp(void) {
   close(listener);
 }
 
+// Exercise the per-call flag through an alias without changing the shared
+// open-file-description flags, including invalid descriptors and zero-length
+// datagrams. The other sections cover blocking calls and other socket kinds.
+static ssize_t send_packet(int kind, int fd, char *data, size_t size) {
+  if (kind == 0) return sendto(fd, data, size, MSG_DONTWAIT, NULL, 0);
+  struct iovec iov = {.iov_base = data, .iov_len = size};
+  struct msghdr message = {.msg_iov = &iov, .msg_iovlen = 1};
+  if (kind == 1) return sendmsg(fd, &message, MSG_DONTWAIT);
+  struct mmsghdr batch = {.msg_hdr = message};
+  int count = sendmmsg(fd, &batch, 1, MSG_DONTWAIT);
+  if (count < 0) return count;
+  check(count == 1, "sendmmsg count");
+  return batch.msg_len;
+}
+
+static ssize_t receive_packet(int kind, int fd, char *data, size_t size) {
+  if (kind == 0) return recvfrom(fd, data, size, MSG_DONTWAIT, NULL, NULL);
+  struct iovec iov = {.iov_base = data, .iov_len = size};
+  struct msghdr message = {.msg_iov = &iov, .msg_iovlen = 1};
+  if (kind == 1) return recvmsg(fd, &message, MSG_DONTWAIT);
+  struct mmsghdr batch = {.msg_hdr = message};
+  int count = recvmmsg(fd, &batch, 1, MSG_DONTWAIT, NULL);
+  if (count < 0) return count;
+  check(count == 1, "recvmmsg count");
+  return batch.msg_len;
+}
+
+static void descriptor_flags(void) {
+  for (int kind = 0; kind < (batched ? 3 : 2); kind++) {
+    int pair[2];
+    check(socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) == 0, "socketpair");
+    int alias = dup(pair[0]);
+    check(alias >= 0, "dup");
+    int capacity = 4096;
+    check(setsockopt(pair[0], SOL_SOCKET, SO_SNDBUF, &capacity, sizeof(capacity)) == 0,
+          "setsockopt SO_SNDBUF");
+    char sent = 'q', received = 0;
+    check(receive_packet(kind, pair[1], &received, 1) == -1 && errno == EAGAIN,
+          "empty receive");
+    check(send_packet(kind, -1, &sent, 1) == -1 && errno == EBADF, "invalid send");
+    check(receive_packet(kind, -1, &received, 1) == -1 && errno == EBADF,
+          "invalid receive");
+    check(send_packet(kind, alias, &sent, 1) == 1, "aliased send");
+    check(receive_packet(kind, pair[1], &received, 1) == 1 && received == sent,
+          "queued receive");
+
+    unsigned queued = 0;
+    while (send_packet(kind, alias, &sent, 1) == 1) {
+      check(++queued < 1024, "bounded send queue");
+    }
+    check(errno == EAGAIN && queued > 0, "full send queue");
+    for (unsigned index = 0; index < queued; index++)
+      check(receive_packet(kind, pair[1], &received, 1) == 1 && received == sent,
+            "drain queued datagram");
+    check(receive_packet(kind, pair[1], &received, 1) == -1 && errno == EAGAIN,
+          "drained receive");
+
+    check(send_packet(kind, alias, &sent, 0) == 0, "zero-length send");
+    check(receive_packet(kind, pair[1], &received, 1) == 0, "zero-length receive");
+    int descriptors[] = {pair[0], pair[1], alias};
+    for (size_t index = 0; index < sizeof(descriptors) / sizeof(descriptors[0]); index++) {
+      int flags = fcntl(descriptors[index], F_GETFL);
+      check(flags >= 0 && !(flags & O_NONBLOCK), "descriptor remains blocking");
+      check(close(descriptors[index]) == 0, "close descriptor");
+    }
+  }
+  puts("per-call nonblocking preserves descriptor flags, aliases and datagrams");
+}
+
 // Runs every section, or only those named on the command line, and makes no
 // recvmmsg or sendmmsg call after the argument "unbatched". Record and replay
 // keep an accepted TCP connection only in the log and refuse recvmmsg on it.
@@ -245,7 +315,8 @@ int main(int argc, char **argv) {
   } sections[] = {{"udp", udp},
                   {"unix_datagram", unix_datagram},
                   {"unix_stream", unix_stream},
-                  {"tcp", tcp}};
+                  {"tcp", tcp},
+                  {"descriptor_flags", descriptor_flags}};
   int named = 0;
   setvbuf(stdout, NULL, _IOLBF, 0);
   for (int j = 1; j < argc; j++) {

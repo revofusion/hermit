@@ -15,10 +15,10 @@
  *     0, a negative pid or -1 and returns ESRCH, natively and under Hermit.
  *   - kill(INT_MIN, sig) is ESRCH, for SIGKILL too: Linux rejects INT_MIN
  *     before anything else.
- *   - kill(0, sig), kill(-pgrp, sig) and kill(-1, sig) signal every process
- *     in a set; Detcore does not model that and refuses them by name. A
- *     fail-closed run stops with the policy-refusal status at kill(0);
- *     --allow-unsupported-syscalls returns ENOSYS for each.
+ *   - kill(0, sig) and kill(-pgrp, sig) deliver to modeled group members on
+ *     native sequentialized backends. kill(-1, sig) remains refused: strict
+ *     runs stop at that broadcast; permissive runs return ENOSYS for it.
+ *     Non-sequentialized group sends remain refused for host safety.
  * kill(-1, sig) runs only with the argument "broadcast": natively it would
  * signal every process the user may signal. With the argument "inherited" the
  * guest keeps the process group it started in, which under Hermit is
@@ -37,6 +37,9 @@
  * an i386 getpid that must still work. Run all three only inside setsid.
  * With "tty" it runs on a terminal: it reads a line from it, tries
  * TIOCSIG on /dev/tty, then waits for Ctrl-C.
+ * With "self-group-sigkill" a parent checks that a child alone in its own
+ * group dies from either kill(0, SIGKILL) or kill(-pgrp, SIGKILL), including
+ * on process-control backends that cannot deliver across processes.
  */
 
 #define _GNU_SOURCE
@@ -48,6 +51,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #ifndef SYS_pidfd_open
@@ -105,6 +109,28 @@ int main(int argc, char** argv) {
   int group_only = argc > 1 && strcmp(argv[1], "group-only") == 0;
   int lead_then_kill = argc > 1 && strcmp(argv[1], "lead-then-kill") == 0;
   int other_routes = argc > 1 && strcmp(argv[1], "other-routes") == 0;
+  if (argc > 1 && strcmp(argv[1], "self-group-sigkill") == 0) {
+    for (int named = 0; named < 2; named++) {
+      pid_t child = fork();
+      if (child == -1) {
+        return 5;
+      }
+      if (child == 0) {
+        if (setpgid(0, 0) != 0) {
+          _exit(6);
+        }
+        kill(named ? -getpgrp() : 0, SIGKILL);
+        _exit(7);
+      }
+      int status;
+      if (waitpid(child, &status, 0) != child ||
+          !WIFSIGNALED(status) || WTERMSIG(status) != SIGKILL) {
+        return 8;
+      }
+      printf("self-group %s: SIGKILL\n", named ? "named" : "own");
+    }
+    return 0;
+  }
   if (argc > 1 && strcmp(argv[1], "tty") == 0) {
     char line[64];
     setvbuf(stdout, NULL, _IONBF, 0);

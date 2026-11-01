@@ -3646,6 +3646,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             FdType::Epoll,
         )
         .await?;
+        crate::event_driven_io::created(guest, fd, true).await;
         Ok(fd as i64)
     }
 
@@ -3663,7 +3664,20 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let dettid = guest.thread_state().dettid;
         resource_request(guest, Resources::new(dettid)).await; // empty request
-        Ok(self.record_or_replay(guest, call).await?)
+        let result = self.record_or_replay(guest, call).await?;
+        if self.cfg.event_driven_io {
+            if let Some(epoll) = crate::event_driven_io::key(guest, call.epfd()) {
+                let target = crate::event_driven_io::key(guest, call.fd());
+                let identity = guest.thread_state().with_detfd(call.fd(), |fd| fd.open_file_id()).ok();
+                crate::tool_global::event_driven_io(
+                    guest,
+                    crate::event_driven_io::Update::Epoll {
+                        epoll, fd: call.fd(), identity, target, operation: call.op(),
+                    },
+                ).await;
+            }
+        }
+        Ok(result)
     }
 
     /// epoll_pwait syscall (MAYHANG)
@@ -4319,8 +4333,155 @@ impl<T: RecordOrReplay> Detcore<T> {
             let mut rsrc = Resources::new(guest.thread_state().dettid);
             rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
             rsrc.fyi("epoll_wait");
+            // epoll_wait is interrupted with EINTR even with SA_RESTART.
+            // The native process-signal reservation may wake this poll while
+            // pinning its unique pending copy through the actual dequeue.
+            // Ordinary unreserved EINTR polls retain their existing policy.
+            rsrc.set_signal_interrupt_errno(Errno::EINTR);
+            rsrc.signal_state_task = crate::syscalls::helpers::guest_signal_state_task(guest);
             retry_nonblocking_syscall_with_timeout(guest, call, rsrc, maybe_timeout_ns).await
         }
+    }
+
+    /// One nonblocking connect attempt with native autobind semantics. A temporary
+    /// per-socket range selects the source port without marking it explicitly bound
+    /// (which would incorrectly keep an implicit UDP port after AF_UNSPEC disconnect).
+    /// Restore the option before returning to the retry loop or yielding to a peer.
+    pub(super) async fn inject_connect_with_source_port<G: Guest<Self>>(
+        guest: &mut G,
+        call: syscalls::Connect,
+    ) -> Result<i64, Error> {
+        // Linux UAPI <linux/in.h>, since 6.3; not exposed by our libc crate yet.
+        const IP_LOCAL_PORT_RANGE: i32 = 51;
+        if !guest.config().sequentialize_threads || guest.config().recordreplay_modes {
+            return Ok(guest.inject_with_retry(call).await?);
+        }
+        let Some(destination) = call.uservaddr() else {
+            return Ok(guest.inject_with_retry(call).await?);
+        };
+        let length = usize::try_from(call.addrlen()).unwrap_or(0);
+        let mut destination_bytes = [0u8; std::mem::size_of::<libc::sockaddr_storage>()];
+        if !(2..=destination_bytes.len()).contains(&length)
+            || guest
+                .memory()
+                .read_exact(destination.cast(), &mut destination_bytes[..length])
+                .is_err()
+        {
+            return Ok(guest.inject_with_retry(call).await?);
+        }
+        let family = u16::from_ne_bytes([destination_bytes[0], destination_bytes[1]]);
+        let minimum = match i32::from(family) {
+            libc::AF_INET => std::mem::size_of::<libc::sockaddr_in>(),
+            libc::AF_INET6 => std::mem::offset_of!(libc::sockaddr_in6, sin6_scope_id),
+            _ => return Ok(guest.inject_with_retry(call).await?),
+        };
+        if length < minimum {
+            return Ok(guest.inject_with_retry(call).await?);
+        }
+        let Ok(open_file_id) = guest
+            .thread_state()
+            .with_detfd(call.fd(), |fd| fd.open_file_id())
+        else {
+            return Ok(guest.inject_with_retry(call).await?);
+        };
+
+        let mut stack = guest.stack().await;
+        let address: AddrMut<libc::sockaddr_in6> = stack.reserve();
+        let option_length: AddrMut<libc::socklen_t> = stack.reserve();
+        let value: AddrMut<u32> = stack.reserve();
+        let original_range: AddrMut<u32> = stack.reserve();
+        let _guard = stack.commit()?;
+        guest.memory().write_value(
+            option_length,
+            &(std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t),
+        )?;
+        let name_call = syscalls::Getsockname::new()
+            .with_fd(call.fd())
+            .with_usockaddr(Some(address.cast()))
+            .with_usockaddr_len(Some(option_length));
+        match guest.inject_with_retry(name_call).await {
+            Err(Errno::EBADF | Errno::ENOTSOCK) => {
+                return Ok(guest.inject_with_retry(call).await?);
+            }
+            result => result?,
+        };
+        let local: [u16; 2] = guest.memory().read_value(address.cast())?;
+        if local[0] != family || local[1] != 0 {
+            return Ok(guest.inject_with_retry(call).await?);
+        }
+        guest.memory().write_value(option_length, &4)?;
+        let type_call = syscalls::Getsockopt::new()
+            .with_fd(call.fd())
+            .with_level(libc::SOL_SOCKET)
+            .with_optname(libc::SO_TYPE)
+            .with_optval(Some(value.cast()))
+            .with_optlen(Some(option_length));
+        guest.inject_with_retry(type_call).await?;
+        if !matches!(
+            guest.memory().read_value(value)? as i32,
+            libc::SOCK_STREAM | libc::SOCK_DGRAM
+        ) {
+            return Ok(guest.inject_with_retry(call).await?);
+        }
+        let range_call = type_call
+            .with_level(libc::IPPROTO_IP)
+            .with_optname(IP_LOCAL_PORT_RANGE)
+            .with_optval(Some(original_range.cast()));
+        match guest.inject_with_retry(range_call).await {
+            Err(Errno::ENOPROTOOPT) => {
+                let strict = guest.config().panic_on_unsupported_syscalls;
+                return crate::syscalls::helpers::refuse_unserviceable_operation_with(
+                    guest,
+                    strict,
+                    Sysno::connect,
+                    Errno::EOPNOTSUPP,
+                    Some("deterministic native client autobind requires IP_LOCAL_PORT_RANGE"),
+                )
+                .await;
+            }
+            result => result?,
+        };
+        let range = guest.memory().read_value(original_range)?;
+        let response = send_and_update_time(
+            guest,
+            GlobalRequest::RequestConnectPort(open_file_id, range),
+        )
+        .await;
+        let port = match response.1 {
+            GlobalResponse::RequestPort(port) => u32::from(port),
+            GlobalResponse::PortFull => return Err(Errno::EADDRNOTAVAIL.into()),
+            _ => unreachable!(),
+        };
+        guest.memory().write_value(value, &(port | (port << 16)))?;
+        let select_port = syscalls::Setsockopt::new()
+            .with_fd(call.fd())
+            .with_level(libc::IPPROTO_IP)
+            .with_optname(IP_LOCAL_PORT_RANGE)
+            .with_optval(Some(value.cast().into()))
+            .with_optlen(4);
+        if let Err(error) = guest.inject_with_retry(select_port).await {
+            send_and_update_time(guest, GlobalRequest::ReleasePort(open_file_id)).await;
+            if matches!(error, Errno::EINVAL | Errno::ENOPROTOOPT) {
+                let strict = guest.config().panic_on_unsupported_syscalls;
+                return crate::syscalls::helpers::refuse_unserviceable_operation_with(
+                    guest,
+                    strict,
+                    Sysno::connect,
+                    Errno::EOPNOTSUPP,
+                    Some("kernel cannot constrain native autobind to a single source port"),
+                )
+                .await;
+            }
+            return Err(error.into());
+        }
+        let result = guest.inject_with_retry(call).await;
+        let restore = select_port.with_optval(Some(original_range.cast().into()));
+        guest.inject_with_retry(restore).await.map_err(|error| {
+            Error::Tool(anyhow::anyhow!(
+                "cannot restore the guest's IP_LOCAL_PORT_RANGE after connect: {error}"
+            ))
+        })?;
+        Ok(result?)
     }
 
     /// Connect system call (MAYHANG)
@@ -4872,6 +5033,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         let (sent, unread) = sent_descriptors(guest, &headers);
         crate::reserved_input::before_descriptor_export(guest, &sent, unread)
             .unwrap_or_else(|error| panic!("reserved-input export publication failed: {error}"));
+        if (!sent.is_empty() || unread) && guest.config().event_driven_io {
+            if let Some(registry) = guest.local_state().and_then(|global| global.flock_waits.as_ref()) {
+                registry.disable();
+            }
+        }
         if guest.thread_state().passed_descriptors_out_reported {
             return false;
         }
@@ -5015,6 +5181,112 @@ where
             .and_then(|header| guest.memory().read_value::<_, Msghdr>(header).ok())
             .is_none_or(|header| header.msg_namelen != 0)
     })
+}
+
+/// A physically nonblocking attempt runs under the serialized turn. Inspect
+/// the exact messages here, not at syscall entry before a possible retry.
+pub(crate) async fn event_driven_send_attempt<T, G>(guest: &mut G, call: Syscall)
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    use crate::event_driven_io::{key, Key, Update};
+    if !guest.config().event_driven_io { return; }
+    let (sent, unread) = match call {
+        Syscall::Sendmsg(send) => {
+            let Some(header) = send.msg() else { return; };
+            sent_descriptors(guest, &[header.as_raw()])
+        }
+        Syscall::Sendmmsg(send) => {
+            let Some(vector) = send.msgvec() else { return; };
+            let headers: Vec<_> = (0..send.vlen().min(libc::UIO_MAXIOV as u32) as usize)
+                .map(|index| vector.as_raw() + index * std::mem::size_of::<Mmsghdr>())
+                .collect();
+            sent_descriptors(guest, &headers)
+        }
+        _ => return,
+    };
+    let (_, args) = call.into_parts();
+    let proven_guest_transfer = !unread
+        && guest.thread_state().with_detfd(args.arg0 as i32, |file| {
+            file.is_guest_held()
+        }).unwrap_or(false);
+    if proven_guest_transfer && !sent.is_empty() {
+        if let Some(registry) = guest.local_state().and_then(|global| global.flock_waits.as_ref()) {
+            let _ = guest.thread_state().with_detfd(args.arg0 as i32, |file| {
+                file.watch_flock_rights(registry);
+            });
+        }
+    }
+    let restricted_internal_transfer = !unread && !sent.is_empty()
+        && guest.thread_state().with_detfd(args.arg0 as i32, |file| {
+            file.is_socketpair_endpoint()
+                && file.socket_domain() == Some(crate::event_driven_io::SocketDomain::Unix)
+        }).unwrap_or(false)
+        && sent.iter().all(|fd| {
+            guest.thread_state().with_detfd(*fd, |file| {
+                (file.ty() == crate::fd::FdType::Pipe
+                    && file.channel().is_some_and(|end| {
+                        matches!(end.channel, crate::pipe_wake::ChannelId::Pipe(_))
+                    }))
+                    || (proven_guest_transfer && file.flock_domain().is_some())
+            }).unwrap_or(false)
+        });
+    if unread || (!sent.is_empty() && !restricted_internal_transfer) {
+        // Anonymous pipes and proven private regular files cannot convey a
+        // socket/directory/namespace capability. Pipe alias custody remains
+        // conservative below; native flock aliases retain their shared domain.
+        tracing::info!(target: "detcore::event_driven_io", unread, descriptors = ?sent,
+            "event-driven socket domains revoked: unproven SCM_RIGHTS transfer");
+        for domain in [
+            crate::event_driven_io::SocketDomain::Unix,
+            crate::event_driven_io::SocketDomain::TcpNoIngress,
+        ] {
+            crate::tool_global::event_driven_io(guest, Update::RevokeSocketDomain(domain)).await;
+        }
+    }
+    let update = if unread {
+        Update::RevokeAll
+    } else {
+        let mut flock_changes = Vec::new();
+        let keys: std::collections::BTreeSet<_> = sent.into_iter()
+            .filter_map(|fd| key(guest, fd))
+            .filter(|key| {
+                if proven_guest_transfer && matches!(key, Key::Flock(_)) {
+                    flock_changes.push(*key);
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
+        if !flock_changes.is_empty() {
+            crate::tool_global::event_driven_io(guest, Update::Change(flock_changes)).await;
+        }
+        if keys.is_empty() { return; }
+        Update::Revoke(keys.into_iter().collect())
+    };
+    tracing::info!(target: "detcore::event_driven_io", "event-driven IO authority revoked: SCM_RIGHTS attempt");
+    crate::tool_global::event_driven_io(guest, update).await;
+}
+
+/// Background I/O can mutate a queue after its owner relinquishes the turn.
+/// Revoke before that grant, not when the background injection starts.
+pub(crate) async fn event_driven_external_attempt<T, G>(guest: &mut G, call: Syscall)
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    if !guest.config().event_driven_io { return; }
+    let (number, args) = call.into_parts();
+    if !crate::event_driven_io::socket_mutation(number) { return; }
+    let socket = guest.thread_state().with_detfd(args.arg0 as i32, |fd| {
+        fd.ty() == crate::fd::FdType::Socket
+    }).unwrap_or(true);
+    if socket || matches!(call, Syscall::Sendmsg(_) | Syscall::Sendmmsg(_)) {
+        tracing::info!(target: "detcore::event_driven_io", "event-driven IO disabled: background socket/unknown producer");
+        crate::tool_global::event_driven_io(guest, crate::event_driven_io::Update::Disable).await;
+    }
 }
 
 /// The descriptors the messages at `headers` name in `SCM_RIGHTS`, and

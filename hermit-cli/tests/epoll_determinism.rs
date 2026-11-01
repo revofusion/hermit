@@ -62,6 +62,7 @@ fn epoll_guest() -> &'static Path {
             .args([
                 "-O0",
                 "-g",
+                "-pthread",
                 "-D_GNU_SOURCE",
                 "-std=c11",
                 "-Wall",
@@ -402,6 +403,65 @@ fn notification_control_syscalls_are_deterministic() {
 #[ignore = "e2e: requires hermit + mount namespaces"]
 fn notification_control_syscalls_reach_strict_verify_l2() {
     assert_scenario_reaches_l2("control-fds");
+}
+
+/// Implicit TCP closes from a nonleader's exit_group must be complete before
+/// a peer's next epoll turn. The alias case keeps one endpoint alive in the
+/// parent: the scheduler must wait for process cleanup, not socket EOF.
+#[test]
+fn tcp_group_exit_readiness_reaches_strict_verify() {
+    let _guard = hermit_run_lock();
+    let guest = epoll_guest();
+    for scenario in ["tcp-exit", "tcp-exit-alias"] {
+        let verdict = guest
+            .parent()
+            .unwrap()
+            .join(format!("verify-{scenario}.json"));
+        let mut command = Command::new("timeout");
+        command
+            .args(["--kill-after", "5s", "60s"])
+            .arg(hermit_test::hermit_binary())
+            .args([
+                "--log=info",
+                "--backend=ptrace",
+                "run",
+                "--strict",
+                "--verify",
+                "--verify-strict",
+                "--base-env=minimal",
+            ])
+            .arg(format!("--verify-json={}", verdict.display()))
+            .arg("--")
+            .arg(guest)
+            .arg(scenario);
+        let output = command_output(command, scenario);
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(&format!("{scenario} success")),
+            "{scenario} omitted its success marker"
+        );
+        let report: serde_json::Value = serde_json::from_slice(
+            &fs::read(&verdict).expect("strict verification wrote no verdict"),
+        )
+        .expect("strict verification verdict is valid JSON");
+        assert_eq!(
+            report["verdict"],
+            serde_json::json!("matched"),
+            "{scenario}"
+        );
+        assert_eq!(
+            report["bitwise_parity"],
+            serde_json::json!(true),
+            "{scenario}"
+        );
+        for side in ["left", "right"] {
+            assert!(
+                report["compared_log_messages"][side]
+                    .as_u64()
+                    .is_some_and(|count| count > 0),
+                "{scenario}: no {side} INFO messages were compared: {report}"
+            );
+        }
+    }
 }
 
 /// Regression test: descriptor-table operations on an epoll fd (F_GETFL,

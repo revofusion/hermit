@@ -38,7 +38,6 @@ fn sysv_and_legacy_filesystem_features_fall_back_deterministically() {
 
     let cases = [
         ("sysv_sem", repository.join("tests/c/sysv_sem_enosys.c")),
-        ("sysv_shm", repository.join("tests/c/sysv_shm_enosys.c")),
         ("ustat", repository.join("tests/c/ustat_enosys.c")),
     ];
 
@@ -74,5 +73,68 @@ fn sysv_and_legacy_filesystem_features_fall_back_deterministically() {
             stdout.contains("Determinism verified") || stderr.contains("Determinism verified"),
             "{syscall} omitted Hermit's determinism marker\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
+    }
+}
+
+#[test]
+fn kvm_sysv_shared_memory_has_real_bytes_and_mm_lifecycle() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping KVM SysV shared memory: /dev/kvm is unavailable");
+        return;
+    }
+    shared_memory_lifecycle("kvm");
+}
+
+#[test]
+fn ptrace_sysv_shared_memory_has_real_bytes_and_mm_lifecycle() {
+    shared_memory_lifecycle("ptrace");
+}
+
+fn shared_memory_lifecycle(backend: &str) {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let directory = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("{backend}-sysv-shm-{}", std::process::id()));
+    fs::create_dir_all(&directory).unwrap();
+    let guest = directory.join("sysv_shm");
+    let mut compile = Command::new("cc");
+    compile
+        .args(["-O2", "-std=c11", "-Wall", "-Wextra", "-Werror"])
+        .arg(repository.join("tests/c/sysv_shm.c"))
+        .arg("-o")
+        .arg(&guest);
+    command_output(compile, "SysV shared-memory guest compilation");
+    for uid in [0, 1000] {
+        let mut run = Command::new("timeout");
+        run.args(["--kill-after", "5s", "120s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .arg("--log=info")
+            .arg(format!("--backend={backend}"))
+            .args(["run", "--strict", "--verify", "--base-env=minimal"]);
+        if backend == "kvm" {
+            run.args(["--verify-strict", "--max-timeslice=disabled"]);
+        }
+        run.arg(format!("--virtual-uid={uid}"))
+            .arg(format!("--virtual-gid={uid}"))
+            .arg("--")
+            .arg(&guest);
+        let output = command_output(run, &format!("{backend} SysV shared-memory lifecycle"));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stdout.contains(
+                "sysv-shm shared=fork aliases=ok stat=ok rmid=ok exec=ok exit=ok errors=ok"
+            ),
+            "missing behavioral contract: {stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains("Determinism verified") || stderr.contains("Determinism verified"),
+            "missing verification marker: {stdout}\n{stderr}"
+        );
+        if backend == "kvm" {
+            assert!(
+                stderr.contains("hermit::kvm: launching guest through reverie-kvm"),
+                "test did not exercise KVM: {stderr}"
+            );
+        }
     }
 }

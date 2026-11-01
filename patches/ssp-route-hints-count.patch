@@ -1,0 +1,12 @@
+diff --git a/sparkcore/invoice/invoice_manager.py b/sparkcore/invoice/invoice_manager.py
+--- a/sparkcore/invoice/invoice_manager.py
++++ b/sparkcore/invoice/invoice_manager.py
+@@ -454,6 +454,8 @@
+         max_route_hints = max(
+             knobs.get_int_value(Knob.SPARKNODE_ROUTE_HINTS_COUNT, default=1), 0
+         )
++        if max_route_hints == 0:
++            return []
+         routing_nodes = await self._gen_ranked_routing_nodes_for_ldk(node)
+         return [
+             [

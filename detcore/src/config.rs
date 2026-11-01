@@ -178,6 +178,11 @@ mod tests {
         // renumbered to 21 at landing after main's 20; digests measured at
         // this head).
         (21, "9d583ef0f9243c61", "f013e36743d8d9e6"),
+        // Integrates upstream revision 21 with native process-signal reservations,
+        // deterministic client ports and event-driven IO/OFD dependency payloads.
+        (22, "ffa1435b142beb82", "94273db60f0db69f"),
+        // Adds the stable per-file flock dependency, separate from OFD readiness.
+        (23, "26ba7da2fa7d5e12", "94273db60f0db69f"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
@@ -195,13 +200,31 @@ mod tests {
         code
     }
 
-    /// A digest of the code of `GlobalRequest` and `GlobalResponse` in
-    /// `source`: their variants, payload types, order and attributes, not
-    /// their documentation.
+    /// Wire enums and dependency payloads. The latter live outside the RPC
+    /// declarations but can change positional decoding just as the enums do.
     fn definition_digest(source: &str) -> String {
         let request = definition(source, "pub enum GlobalRequest {").join("\n");
         let response = definition(source, "pub enum GlobalResponse {").join("\n");
-        fnv_domains(&[(0, request.as_bytes()), (1, response.as_bytes())])
+        let io = include_str!("event_driven_io.rs");
+        let key = definition(io, "pub enum Key {").join("\n");
+        let socket_domain = definition(io, "pub enum SocketDomain {").join("\n");
+        let socket_probe = definition(io, "pub struct SocketProbe {").join("\n");
+        let update = definition(io, "pub enum Update {").join("\n");
+        let observer = definition(io, "pub(crate) struct Observer {").join("\n");
+        let snapshot = io.lines().find(|line| line.starts_with("pub struct Snapshot("))
+            .expect("Snapshot wire declaration");
+        let description = definition(include_str!("fd.rs"), "struct OpenFileDescription {").join("\n");
+        fnv_domains(&[
+            (0, request.as_bytes()),
+            (1, response.as_bytes()),
+            (3, key.as_bytes()),
+            (4, update.as_bytes()),
+            (5, observer.as_bytes()),
+            (6, snapshot.as_bytes()),
+            (7, socket_domain.as_bytes()),
+            (8, socket_probe.as_bytes()),
+            (9, description.as_bytes()),
+        ])
     }
 
     fn resources_definition_digest(source: &str) -> String {

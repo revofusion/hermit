@@ -70,6 +70,7 @@ pub(crate) use parked::child_wait_request;
 pub(crate) use parked::parked_wait_request;
 pub(crate) use parked::polled_read_request;
 pub(crate) use parked::signal_dequeued;
+use parking_lot::Mutex as ParkingMutex;
 use reverie::GlobalRPC;
 use reverie::GlobalTool;
 use reverie::Guest;
@@ -1184,6 +1185,9 @@ impl DevicePool {
 #[derive(Debug)]
 pub struct GlobalState {
     sched: Arc<Mutex<Scheduler>>,
+    /// Owned backing files and IPC namespace, never serialized through RPC.
+    pub(crate) sysv_shm: Arc<parking_lot::Mutex<crate::syscalls::sysv_shm::Registry>>,
+    pub(crate) flock_waits: Option<Arc<crate::flock::Registry>>,
     #[cfg(feature = "physical-mm-test-support")]
     initial_mm_probe: Mutex<Option<Arc<initial_mm_probe::Probe>>>,
 
@@ -1213,7 +1217,7 @@ pub struct GlobalState {
     host_id_tasks: AtomicU64,
 
     // used ports
-    used_ports: Mutex<HashSet<u16>>,
+    used_ports: ParkingMutex<HashSet<u16>>,
 
     // Unsupported syscall names observed across every process in this run.
     unsupported_syscalls: Mutex<BTreeSet<String>>,
@@ -1290,7 +1294,7 @@ pub struct GlobalState {
     unsupported_syscall_report_fd: Option<Mutex<File>>,
 
     // Open file description to bound port.
-    open_file_to_port: Mutex<HashMap<OpenFileId, u16>>,
+    open_file_to_port: ParkingMutex<HashMap<OpenFileId, u16>>,
 
     /// Inotify rename cookies renumbered by first observation across the run
     /// (`GlobalRequest::VirtualInotifyCookies`, `crate::syscalls::inotify`).
@@ -1814,6 +1818,7 @@ impl GlobalState {
             crate::scheduler::exit_on_scheduler_refusal(&refusal);
         }
         let sched = Arc::new(Mutex::new(Scheduler::new(cfg)));
+        let flock_waits = sched.lock().unwrap().flock_waits.clone();
         let global_time = Arc::new(Mutex::new(GlobalTime::new(cfg)));
         let process_exit_cleanup = ProcessExitCleanup::default();
 
@@ -1926,6 +1931,10 @@ impl GlobalState {
 
         Self {
             sched,
+            flock_waits,
+            sysv_shm: Arc::new(parking_lot::Mutex::new(
+                crate::syscalls::sysv_shm::Registry::default(),
+            )),
             #[cfg(feature = "physical-mm-test-support")]
             initial_mm_probe: Mutex::new(None),
             next_port: AtomicU16::new(range[0]),
@@ -1937,7 +1946,7 @@ impl GlobalState {
                     .unwrap_or(0),
             ),
             host_id_tasks: AtomicU64::new(0),
-            used_ports: Mutex::new(HashSet::new()),
+            used_ports: ParkingMutex::new(HashSet::new()),
             unsupported_syscalls: Mutex::new(BTreeSet::new()),
             syscall_observation_gaps: Mutex::new(BTreeSet::new()),
             #[cfg(target_arch = "aarch64")]
@@ -1956,7 +1965,7 @@ impl GlobalState {
             unsupported_syscall_report_fd,
             port_start_range: AtomicU16::new(range[0]),
             port_end_range: AtomicU16::new(range[1]),
-            open_file_to_port: Mutex::new(HashMap::new()),
+            open_file_to_port: ParkingMutex::new(HashMap::new()),
             inotify_cookies: Mutex::new(Default::default()),
             past_first_execve: AtomicBool::new(false),
             initial_descriptor_image_complete: AtomicBool::new(false),
@@ -2988,8 +2997,11 @@ impl GlobalTool for GlobalState {
     /// physical exit here; see [`GlobalState::complete_physical_process_exit`].
     fn on_backend_process_exited(&self, pid: i32) {
         if self.cfg.backend.reports_child_exit_publication {
-            // The kernel has published this process's exit to its parent. It
-            // is not a physical-exit barrier report on this backend.
+            // Consuming the leader's final status publishes the exit and
+            // proves every thread has released its descriptor references.
+            // Release the peer-scheduling hold independently of SIGCHLD's
+            // disposition; this backend uses the publication hold rather
+            // than pending_physical_process_exits.
             let released = self
                 .sched
                 .lock()
@@ -3235,8 +3247,8 @@ impl GlobalState {
     /// last reference's going does (`GlobalRequest::ReleasePort`): the port,
     /// if one was reserved.
     fn release_port(&self, open_file: OpenFileId) -> Option<u16> {
-        let mut used_ports = self.used_ports.lock().unwrap();
-        let mut open_file_to_port = self.open_file_to_port.lock().unwrap();
+        let mut used_ports = self.used_ports.lock();
+        let mut open_file_to_port = self.open_file_to_port.lock();
         let port = open_file_to_port.remove(&open_file);
         if let Some(port) = port {
             used_ports.remove(&port);
@@ -4793,6 +4805,18 @@ impl GlobalState {
                     R::ThreadExited
                 }
             }
+            GlobalRequest::NativeEpollGuard(mask, held) => {
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .set_native_epoll_guard(dtid, mask, held);
+                R::NativeEpollGuard(())
+            }
+            GlobalRequest::ProcessSignalDequeue(info) => {
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .authenticate_reserved_dequeue(dtid, info);
+                R::ProcessSignalDequeue(())
+            }
             GlobalRequest::SetSigtimedwaitSet(set) => {
                 let updated = self
                     .lock_rpc_scheduler(false)
@@ -4833,6 +4857,17 @@ impl GlobalState {
                     .await
                     .process_signal_sent(dtid, process);
                 R::ProcessSignalSent(())
+            }
+            GlobalRequest::ReserveProcessSignal(process, signal) => R::ReserveProcessSignal(
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .reserve_process_signal(dtid, process, signal),
+            ),
+            GlobalRequest::FinishProcessSignal(sent) => {
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .finish_process_signal(dtid, sent);
+                R::FinishProcessSignal(())
             }
             GlobalRequest::SetChildTidAddress(address) => {
                 let updated = self
@@ -4904,6 +4939,16 @@ impl GlobalState {
                     threads_counted: inodes.threads_counted,
                 })
             }
+            GlobalRequest::EventDrivenIo(update) => R::EventDrivenIo(
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .event_driven_io_from(dtid, request_mm, update),
+            ),
+            GlobalRequest::EventDrivenIoLifecycle(keys) => R::EventDrivenIo(
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .event_driven_io_lifecycle(dtid, request_mm, keys),
+            ),
             GlobalRequest::ReadyChannel(channel, wants) => R::ReadyChannel(
                 self.lock_rpc_scheduler(false)
                     .await
@@ -5140,6 +5185,14 @@ impl GlobalState {
                     .reserve_sigkill_group(sender, pgid, uid)
                     .ok(),
             ),
+            GlobalRequest::RestrictSigkillProcesses(token, processes) => {
+                R::RestrictSigkillProcesses(
+                    self.lock_rpc_scheduler(false)
+                        .await
+                        .restrict_sigkill_processes(token, processes)
+                        .map_err(|errno| errno.into_raw()),
+                )
+            }
             GlobalRequest::CommitSigkill(token, sent) => {
                 // A send that includes the sender is committed at its Exit
                 // grant, before it is sent: its victims die only afterwards,
@@ -5271,6 +5324,11 @@ impl GlobalState {
                     .await
                     .thread_tree
                     .process_group(process),
+            ),
+            GlobalRequest::ProcessGroupMembers(group) => R::ProcessGroupMembers(
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .process_group_members(group),
             ),
             GlobalRequest::SetProcessGroup(process, group) => R::SetProcessGroup(
                 self.lock_rpc_scheduler(false)
@@ -5694,37 +5752,82 @@ impl GlobalState {
                 let now = self.global_time.lock().unwrap().as_nanos();
                 R::Network(engine.apply(now, request))
             }
-            GlobalRequest::RequestPort(open_file_id) => {
+            GlobalRequest::RequestPort(open_file_id)
+            | GlobalRequest::RequestConnectPort(open_file_id, _) => {
                 let _sched = self.lock_rpc_scheduler(false).await;
-                let mut mut_used_ports = self.used_ports.lock().unwrap();
-                self.update_port_range();
-                let total_available =
-                    self.port_end_range.load(SeqCst) - self.port_start_range.load(SeqCst);
-                let mut index = 0;
-                while (*mut_used_ports).contains(&self.next_port.load(SeqCst))
-                    && index < total_available
-                {
-                    self.next_port.fetch_add(1, SeqCst);
-                    if self.next_port.load(SeqCst) > self.port_end_range.load(SeqCst) {
-                        self.next_port
-                            .store(self.port_start_range.load(SeqCst), SeqCst);
+                let mut used_ports = self.used_ports.lock();
+                let mut open_file_to_port = self.open_file_to_port.lock();
+                let client_range = match request {
+                    GlobalRequest::RequestConnectPort(_, range) => Some(range),
+                    _ => None,
+                };
+                if client_range.is_some() {
+                    // A zero local port means that a previous UDP autobind was
+                    // released by AF_UNSPEC disconnect, even while aliases remain.
+                    if let Some(previous) = open_file_to_port.remove(&open_file_id) {
+                        used_ports.remove(&previous);
                     }
-                    index += 1;
                 }
-                if index == total_available {
+                self.update_port_range();
+                let global_start = self.port_start_range.load(SeqCst);
+                let global_end = self.port_end_range.load(SeqCst);
+                let (start, end) = match client_range {
+                    Some(range) => {
+                        let lower = range as u16;
+                        let upper = (range >> 16) as u16;
+                        // Linux ignores zero bounds and bounds outside the global range.
+                        (
+                            if lower != 0 && (global_start..=global_end).contains(&lower) {
+                                lower
+                            } else {
+                                global_start
+                            },
+                            if upper != 0 && (global_start..=global_end).contains(&upper) {
+                                upper
+                            } else {
+                                global_end
+                            },
+                        )
+                    }
+                    None => (global_start, global_end),
+                };
+                let mut port = self.next_port.load(SeqCst);
+                if !(start..=end).contains(&port) {
+                    port = start;
+                }
+                let mut available = u32::from(end) - u32::from(start) + 1;
+                while used_ports.contains(&port) && available != 0 {
+                    port = if port == end { start } else { port + 1 };
+                    available -= 1;
+                }
+                if available == 0 {
                     R::PortFull
                 } else {
-                    (*mut_used_ports).insert(self.next_port.load(SeqCst));
-                    let mut open_file_to_port = self.open_file_to_port.lock().unwrap();
-                    open_file_to_port.insert(open_file_id, self.next_port.load(SeqCst));
-                    R::RequestPort(self.next_port.load(SeqCst))
+                    used_ports.insert(port);
+                    open_file_to_port.insert(open_file_id, port);
+                    // Do not immediately reuse a closed client's TIME_WAIT tuple.
+                    // The cursor follows the global range; a narrower socket range
+                    // is applied when that socket next requests a port.
+                    self.next_port.store(
+                        if client_range.is_some() {
+                            if port == global_end {
+                                global_start
+                            } else {
+                                port + 1
+                            }
+                        } else {
+                            port
+                        },
+                        SeqCst,
+                    );
+                    R::RequestPort(port)
                 }
             }
             GlobalRequest::AddUsedPort(port, open_file_id) => {
                 let _sched = self.lock_rpc_scheduler(false).await;
-                let mut used_ports = self.used_ports.lock().unwrap();
+                let mut used_ports = self.used_ports.lock();
                 used_ports.insert(port);
-                let mut open_file_to_port = self.open_file_to_port.lock().unwrap();
+                let mut open_file_to_port = self.open_file_to_port.lock();
                 open_file_to_port.insert(open_file_id, port);
                 R::AddUsedPort
             }
@@ -6562,6 +6665,7 @@ impl GlobalState {
                     priority_row: None,
                     slice_expired: false,
                     zero_length_sleep: false,
+                    io_dependencies: None,
                 }
             };
             let nextturn = match sched.next_turns.entry(dettid) {
@@ -7570,11 +7674,11 @@ pub enum SignalScope {
 /// Detcore and a coordinator built at different revisions refuse each other
 /// before either decodes the other's messages. A change to either enum
 /// appends a revision (`config::tests::the_global_rpc_revision_matches_its_definitions`
-/// fails until it does). That test digests the two enums' bodies and
-/// `Resources`: a change to another payload type defined elsewhere
-/// (`CommittedSendWindow`, ...) changes what is on the wire without changing
-/// the digest, and needs a revision appended by hand.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 21;
+/// fails until it does). That test digests the enums, `Resources` and
+/// dependency-generation payloads. Other payloads defined elsewhere
+/// (`CommittedSendWindow`, ...) still require a manual revision when their
+/// wire shape changes.
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 23;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
@@ -7804,6 +7908,14 @@ pub enum GlobalRequest {
     /// while Detcore holds it under a private blocking mask, so the scheduler's
     /// child-exit classification reads the guest's mask, not Detcore's.
     SetSavedGuestSigmask(Option<u64>),
+    /// Plain native epoll_wait's verified private guard (guest, kernel), or
+    /// its verified restoration. Not a guest temporary-mask publication.
+    NativeEpollGuard(
+        Option<(u64, u64)>,
+        Option<crate::scheduler::signal_lists::KernelSiginfo>,
+    ),
+    /// Native callback siginfo, captured before signal-ledger rewrites.
+    ProcessSignalDequeue(Option<crate::scheduler::signal_lists::KernelSiginfo>),
 
     /// The guest's own signal mask that a thread published while Detcore
     /// holds it under a private blocking mask, if any
@@ -7817,6 +7929,10 @@ pub enum GlobalRequest {
     /// The inputs to a process-directed signal the calling thread sends to its
     /// own process (`Scheduler::own_process_signal_inputs`).
     OwnProcessSignalInputs,
+    /// Reserve the native recipient through the process-shared copy's dequeue.
+    ReserveProcessSignal(DetPid, i32),
+    /// Commit or cancel the current sender's reservation after native kill.
+    FinishProcessSignal(bool),
 
     /// The thread of a process that takes the process-directed signal the
     /// calling thread sends naming a task of it
@@ -7993,6 +8109,10 @@ pub enum GlobalRequest {
 
     /// Request a port for an open file description.
     RequestPort(OpenFileId),
+
+    /// Allocate a source port within the socket's host-order IP_LOCAL_PORT_RANGE.
+    /// Advance past it even after the socket closes.
+    RequestConnectPort(OpenFileId, u32),
 
     /// Add a port to the used-port list for an open file description.
     AddUsedPort(u16, OpenFileId),
@@ -8500,6 +8620,16 @@ pub enum GlobalRequest {
     /// after a read, positioned read or seek of it
     /// (`Detcore::store_procfs_sequence`). Appended last.
     StoreProcfsSequence(OpenFileId, crate::procfs::ProcfsSequence),
+    /// Query modeled group members still present, including waitable zombies,
+    /// in deterministic pid order. Appended last to preserve existing wire tags.
+    ProcessGroupMembers(DetPid),
+    /// Keep a validated subset of a SIGKILL reservation, canceling the rest
+    /// before the selected processes commit as one cohort. Appended last.
+    RestrictSigkillProcesses(u64, Vec<DetPid>),
+    /// Dependency generations and mutation authority, under the scheduler lock.
+    EventDrivenIo(crate::event_driven_io::Update),
+    /// Captured old-table keys; only the scheduler authenticates the barrier.
+    EventDrivenIoLifecycle(Vec<crate::event_driven_io::Key>),
 }
 
 /// Responses from the global object
@@ -8545,12 +8675,16 @@ pub enum GlobalResponse {
     DeregisterThread(()),
     SetChildTidAddress(()),
     SetSavedGuestSigmask(()),
+    NativeEpollGuard(()),
+    ProcessSignalDequeue(()),
     PublishedGuestSigmask(Option<u64>),
     SetSigtimedwaitSet(()),
     OwnProcessSignalInputs(OwnProcessSignalInputs),
     ProcessSignalReceiver(ProcessSignalReceiver),
     ProcessSignalSent(()),
     OwnProcessSignalChoice(()),
+    ReserveProcessSignal(Option<DetTid>),
+    FinishProcessSignal(()),
     RecordGuestMarkerSignal(()),
     FutexAction(Option<SchedValue>),
     /// Return the mtime as well:
@@ -8865,6 +8999,12 @@ pub enum GlobalResponse {
     ProcfsSequence(Option<crate::procfs::ProcfsSequence>),
     /// The answer to `GlobalRequest::StoreProcfsSequence`. Appended last.
     StoreProcfsSequence(()),
+    /// The answer to `GlobalRequest::ProcessGroupMembers`. Appended last.
+    ProcessGroupMembers(Vec<DetPid>),
+    /// The narrowed reservation, or an errno; an error changes no state.
+    /// Appended last.
+    RestrictSigkillProcesses(Result<crate::scheduler::sigkill_retirement::SigkillReservation, i32>),
+    EventDrivenIo(Option<crate::event_driven_io::Snapshot>),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -9455,6 +9595,32 @@ where
     );
 }
 
+pub(crate) async fn native_epoll_guard<G, T>(guest: &mut G, mask: Option<(u64, u64)>)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let held = guest
+        .held_signal_info()
+        .map(|info| crate::scheduler::signal_lists::KernelSiginfo::from_user(&info));
+    let (_, response) =
+        send_and_update_time(guest, GlobalRequest::NativeEpollGuard(mask, held)).await;
+    assert!(matches!(response, GlobalResponse::NativeEpollGuard(())));
+}
+
+pub(crate) async fn process_signal_dequeue<G, T>(guest: &mut G)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let info = guest
+        .signal_info()
+        .map(|info| crate::scheduler::signal_lists::KernelSiginfo::from_user(&info));
+    let (_, response) =
+        send_and_update_time(guest, GlobalRequest::ProcessSignalDequeue(info)).await;
+    assert!(matches!(response, GlobalResponse::ProcessSignalDequeue(())));
+}
+
 /// The guest's own signal mask that `thread` published while Detcore holds it
 /// under a private blocking mask, if any (`Scheduler::published_guest_sigmask`):
 /// the `SigBlk` its `/proc` status reports in place of the kernel's
@@ -9659,6 +9825,36 @@ where
         GlobalResponse::OwnProcessSignalChoice(()) => {}
         response => unreachable!("unexpected response to OwnProcessSignalChoice: {response:?}"),
     }
+}
+
+/// Reserve the native dequeue boundary before forwarding a process send.
+pub(crate) async fn reserve_process_signal<G, T>(
+    guest: &mut G,
+    process: DetPid,
+    signal: i32,
+) -> Option<DetTid>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match send_and_update_time(guest, GlobalRequest::ReserveProcessSignal(process, signal))
+        .await
+        .1
+    {
+        GlobalResponse::ReserveProcessSignal(recipient) => recipient,
+        response => unreachable!("unexpected process-signal reservation response: {response:?}"),
+    }
+}
+
+pub(crate) async fn finish_process_signal<G, T>(guest: &mut G, sent: bool)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::FinishProcessSignal(sent))
+        .await
+        .1;
+    assert!(matches!(response, GlobalResponse::FinishProcessSignal(())));
 }
 
 pub(crate) async fn set_child_tid_address<G, T>(guest: &mut G, address: usize)
@@ -10482,12 +10678,11 @@ pub async fn create_vfork_child_thread<G, T>(
             "vfork child priority entropy missing in chaos mode",
         )))
     } else {
-        // POSIX vfork suspends the parent until the child execs or _exits. Give
-        // the vfork child a strictly higher priority (lower number) than the
-        // parent's DEFAULT_PRIORITY so the deterministic scheduler always runs
-        // the child first, rather than round-robining the parent and child at
-        // equal priority (which leaves fork/exec ordering nondeterministic).
-        Some(DEFAULT_PRIORITY - 1)
+        // The scheduler's vfork barrier runs the child first and keeps the
+        // parent parked until exec/exit. Do not retain a priority advantage
+        // after that barrier: a CPU-busy exec'd child would starve ordinary
+        // runnable threads, including its parent and unrelated IO services.
+        Some(DEFAULT_PRIORITY)
     };
 
     let resp = send_and_update_time(
@@ -10989,6 +11184,35 @@ where
     let resp = send_and_update_time(guest, GlobalRequest::DirectorySnapshotMark).await;
     match resp.1 {
         GlobalResponse::DirectorySnapshotMark(mark) => mark,
+        _ => unreachable!(),
+    }
+}
+
+pub(crate) async fn event_driven_io<G, T>(
+    guest: &mut G,
+    update: crate::event_driven_io::Update,
+) -> Option<crate::event_driven_io::Snapshot>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let resp = send_and_update_time(guest, GlobalRequest::EventDrivenIo(update)).await;
+    match resp.1 {
+        GlobalResponse::EventDrivenIo(snapshot) => snapshot,
+        _ => unreachable!(),
+    }
+}
+
+pub(crate) async fn event_driven_io_lifecycle<G, T>(
+    guest: &mut G,
+    keys: Vec<crate::event_driven_io::Key>,
+) where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let resp = send_and_update_time(guest, GlobalRequest::EventDrivenIoLifecycle(keys)).await;
+    match resp.1 {
+        GlobalResponse::EventDrivenIo(None) => {}
         _ => unreachable!(),
     }
 }
@@ -11848,6 +12072,20 @@ where
     let response = send_and_update_time(guest, GlobalRequest::ProcessGroup(process)).await;
     match response.1 {
         GlobalResponse::ProcessGroup(group) => group,
+        _ => unreachable!(),
+    }
+}
+
+/// Modeled processes still present in `group`, sorted by pid. This includes
+/// waitable zombies but never fully reaped or untracked host processes.
+pub async fn process_group_members<G, T>(guest: &mut G, group: DetPid) -> Vec<DetPid>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::ProcessGroupMembers(group)).await;
+    match response.1 {
+        GlobalResponse::ProcessGroupMembers(members) => members,
         _ => unreachable!(),
     }
 }
@@ -12883,6 +13121,29 @@ where
     let response = send_and_update_time(guest, GlobalRequest::CommitSigkill(token, sent)).await;
     match response.1 {
         GlobalResponse::CommitSigkill(()) => {}
+        _ => unreachable!(),
+    }
+}
+
+/// Narrow a SIGKILL reservation to successful sends (and an impending self-send)
+/// before committing them together. Unselected processes are canceled normally;
+/// an invalid token, duplicate or foreign process leaves the reservation intact.
+pub async fn restrict_sigkill_processes<G, T>(
+    guest: &mut G,
+    token: u64,
+    processes: Vec<DetPid>,
+) -> Result<crate::scheduler::sigkill_retirement::SigkillReservation, reverie::Errno>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(
+        guest,
+        GlobalRequest::RestrictSigkillProcesses(token, processes),
+    )
+    .await;
+    match response.1 {
+        GlobalResponse::RestrictSigkillProcesses(result) => result.map_err(reverie::Errno::new),
         _ => unreachable!(),
     }
 }
@@ -20559,16 +20820,17 @@ mod tests {
         );
         let old_mm = old.thread.mm_id;
         super::prepare_exec(&mut old, old_mm, Default::default(), Vec::new(), None).await;
-        {
+        let prepared_reads = {
             let pending = state.pending_exec_states.lock().unwrap();
             let prepared = &pending[&leader].fd_blocking.inherited_reads;
-            assert_eq!(
-                prepared.keys().copied().collect::<BTreeSet<_>>(),
-                BTreeSet::from([fd, alias_fd])
-            );
-            assert!(prepared.values().all(|entry| entry == &origin));
+            // Initial-image discovery can also register the harness's stdin.
+            // Assert the aliases this fixture owns, not incidental stdio.
+            for slot in [fd, alias_fd] {
+                assert_eq!(prepared.get(&slot), Some(&origin));
+            }
             assert!(!prepared.contains_key(&cloexec_fd));
-        }
+            prepared.clone()
+        };
         // Model the physical successful-exec boundary: the old Tool state is
         // gone and Linux has closed the CLOEXEC alias. No native exec is claimed.
         drop(old);
@@ -20587,10 +20849,9 @@ mod tests {
         assert_eq!(successor.thread.mm_id, old_mm.for_exec(leader));
         assert!(state.pending_exec_states.lock().unwrap().is_empty());
         assert_eq!(
-            state.post_exec_fd_blocking.lock().unwrap()[&leader]
-                .inherited_reads
-                .len(),
-            2
+            state.post_exec_fd_blocking.lock().unwrap()[&leader].inherited_reads,
+            prepared_reads,
+            "exec completion must transfer the prepared provenance unchanged"
         );
         assert!(
             !successor

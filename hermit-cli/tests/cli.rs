@@ -237,6 +237,8 @@ static PROCESS_SIGNAL_RECEIVER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static REALTIME_SIGNALS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PIPE_READ_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static OWN_PROCESS_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static PROCESS_SIGNAL_RESERVATION_GUEST: std::sync::LazyLock<PathBuf> =
+    std::sync::LazyLock::new(compile_process_signal_reservation_guest);
 static VDSO_SYMBOL_VERSIONS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_SIGEV_THREAD_ID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_EXEC_FLUSH_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1493,6 +1495,30 @@ fn own_process_signal_guest() -> &'static Path {
     })
 }
 
+fn process_signal_reservation_guest() -> &'static Path {
+    &PROCESS_SIGNAL_RESERVATION_GUEST
+}
+
+fn compile_process_signal_reservation_guest() -> PathBuf {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let build_root = process_build_root("process-signal-reservation");
+    fs::create_dir_all(&build_root).unwrap();
+    let guest = build_root.join("process_signal_reservation");
+    let output = Command::new("cc")
+        .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+        .arg(repository.join("tests/c/process_signal_reservation.c"))
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile process-signal reservation guest");
+    assert!(
+        output.status.success(),
+        "process-signal reservation compilation failed:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    guest
+}
+
 fn realtime_signals_guest() -> &'static Path {
     REALTIME_SIGNALS_GUEST.get_or_init(|| {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1910,28 +1936,30 @@ fn received_directory_openat_guest() -> &'static Path {
 /// The C guest `tests/c/<name>.c`, compiled once per test process with
 /// `-pthread` into this process's build root.
 fn compiled_c_guest(cell: &'static OnceLock<PathBuf>, name: &str) -> &'static Path {
-    cell.get_or_init(|| {
-        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("hermit-cli should be inside the repository");
-        let build_root = process_build_root(name);
-        fs::create_dir_all(&build_root).expect("failed to create the guest's build directory");
-        let guest = build_root.join(name);
-        let output = Command::new("cc")
-            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
-            .arg(repository.join(format!("tests/c/{name}.c")))
-            .arg("-o")
-            .arg(&guest)
-            .output()
-            .unwrap_or_else(|error| panic!("failed to compile {name}: {error}"));
-        assert!(
-            output.status.success(),
-            "{name} compilation failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-        guest
-    })
+    cell.get_or_init(|| compile_c_guest(name))
+}
+
+fn compile_c_guest(name: &str) -> PathBuf {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build_root = process_build_root(name);
+    fs::create_dir_all(&build_root).expect("failed to create the guest's build directory");
+    let guest = build_root.join(name);
+    let output = Command::new("cc")
+        .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+        .arg(repository.join(format!("tests/c/{name}.c")))
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to compile {name}: {error}"));
+    assert!(
+        output.status.success(),
+        "{name} compilation failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    guest
 }
 
 fn thread_join_after_exit_guest() -> &'static Path {
@@ -17053,6 +17081,39 @@ fn run_kvm_self_sigkill_from_nonleader_is_group_fatal() {
     assert!(
         log.contains(":: Backend: KVM (reverie-kvm KvmGuest<Detcore>)"),
         "KVM self-SIGKILL regression did not use the KVM backend:\n{log}"
+    );
+}
+
+#[test]
+fn run_kvm_singleton_process_group_sigkill_is_group_fatal() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping KVM singleton-group SIGKILL regression: /dev/kvm is unavailable");
+        return;
+    }
+    let _guard = hermit_run_guard();
+    let program = kill_process_group_guest()
+        .to_str()
+        .expect("process-group SIGKILL guest path should be UTF-8");
+    let args = [
+        "--backend=kvm",
+        "run",
+        "--verify",
+        "--verify-strict",
+        "--",
+        program,
+        "self-group-sigkill",
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(
+        stdout(&output),
+        "self-group own: SIGKILL\nself-group named: SIGKILL\n"
+    );
+    let log = stderr(&output);
+    assert!(
+        log.contains(":: comparison=BitwiseInfoV1 relaxations=none")
+            && log.contains(":: Success: deterministic. Determinism verified."),
+        "KVM singleton-group SIGKILL verification failed:\n{log}"
     );
 }
 
@@ -37905,9 +37966,12 @@ fn msg_errqueue_returns_at_once_on_inet_sockets_and_waits_on_unix_sockets() {
 /// without `MSG_WAITFORONE`), sendto, sendmsg and sendmmsg on UDP, AF_UNIX
 /// datagram and stream socketpairs and TCP, with nothing queued, with data,
 /// and with a full peer, and calls without the flag on the same sockets, which
-/// still wait. Its native output is the oracle, under `hermit run` with and
-/// without `--strict`, and its socketpair sections without the batched calls,
-/// which record and replay do not record, under `record start --verify`.
+/// still wait. Aliases, invalid descriptors, zero-length datagrams, and F_GETFL
+/// also retain their native semantics across all six APIs. Its native output
+/// is the oracle, under `hermit run` with and without `--strict`; the alias and
+/// descriptor checks also require canonical verification. Its socketpair sections run
+/// without the batched calls, which record and replay do not record, under
+/// `record start --verify`.
 #[test]
 fn msg_dontwait_returns_at_once_on_a_blocking_socket() {
     let _lock = hermit_run_guard();
@@ -37959,6 +38023,7 @@ fn msg_dontwait_returns_at_once_on_a_blocking_socket() {
         socketpairs(true),
         receives("tcp connected", true),
         receives("tcp accepted", true),
+        "per-call nonblocking preserves descriptor flags, aliases and datagrams\n".to_owned(),
     ]
     .concat();
     assert_eq!(native_stdout(guest), expected);
@@ -37972,6 +38037,43 @@ fn msg_dontwait_returns_at_once_on_a_blocking_socket() {
         let output = hermit(&args);
         assert_success(&output, &args);
         assert_eq!(stdout(&output), expected, "{args:?}");
+    }
+
+    let verification = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let verdict = verification.path().join("verify.json");
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "--log=info",
+            "--backend=ptrace",
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            verdict.to_str().unwrap(),
+            "--timeout",
+            "30",
+            "--",
+            guest,
+            "descriptor_flags",
+        ]),
+        verification.path(),
+        Duration::from_secs(90),
+        false,
+    );
+    assert_eq!(status.and_then(|status| status.code()), Some(0), "{log}");
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&verdict).unwrap()).unwrap();
+    assert_eq!(report["verdict"], "matched", "{report}");
+    assert_eq!(report["verified"], true, "{report}");
+    assert_eq!(report["bitwise_parity"], true, "{report}");
+    for side in ["left", "right"] {
+        assert!(
+            report["compared_log_messages"][side]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "no {side} INFO messages compared: {report}",
+        );
     }
 
     let data = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -41234,6 +41336,58 @@ fn verify_sigkill_cross_process_modes(modes: &[(&str, &str, u32)]) {
     }
 }
 
+/// The peer must observe the same deterministic source port as the client,
+/// including consecutive TCP clients whose closed sockets remain in TIME_WAIT.
+#[test]
+fn implicit_ip_client_ports_verify_at_bitwise_parity() {
+    let _guard = hermit_run_guard();
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let build_root = process_build_root("connect-source-port");
+    fs::create_dir_all(&build_root).expect("create connect-source-port guest directory");
+    let guest = build_root.join("connect_source_port");
+    let compiled = Command::new("cc")
+        .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+        .arg(repository.join("tests/c/connect_source_port.c"))
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("compile connect-source-port guest");
+    assert!(
+        compiled.status.success(),
+        "connect-source-port compilation failed: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    for mode in [None, Some("recycle")] {
+        let mut args = vec![
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--",
+            guest.to_str().unwrap(),
+        ];
+        args.extend(mode);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert!(
+            stderr(&output).contains(":: comparison=BitwiseInfoV1 relaxations=none"),
+            "source-port replay did not use the canonical comparison: {}",
+            stderr(&output)
+        );
+    }
+}
+
+/// A child's SIGCHLD can stop the next native send before it runs. Fanout must
+/// still kill the multithreaded descendant, rather than return partial success.
+#[test]
+fn a_group_sigkill_completes_after_an_interrupted_native_send() {
+    verify_sigkill_cross_process_modes(&[(
+        "parentgroup",
+        "64 parent-owned groups, including multithreaded exec descendants, killed and reaped\n",
+        1,
+    )]);
+}
+
 /// A SIGKILL to another process or a process group (see
 /// `verify_sigkill_cross_process_modes`); the kills of a child, of the
 /// sender's own process group with itself in it, of a zombie and of a pipe's
@@ -42999,6 +43153,89 @@ fn a_slice_that_ends_at_a_signal_stop_puts_its_delivery_behind_other_threads() {
     );
 }
 
+/// Native kill keeps SI_USER and the selected receiver. Runnable unmaskers and
+/// post-send consumers cannot steal its copy; a separate thread-pending signal
+/// is consumed independently. The comparison is never relaxed.
+#[test]
+fn a_cross_process_caught_signal_keeps_its_selected_native_receiver() {
+    let _guard = hermit_run_guard();
+    let guest = process_signal_reservation_guest().to_str().unwrap();
+    for mode in [
+        "unique",
+        "leader",
+        "adversary",
+        "restart",
+        "pdeath-epoll",
+        "cpu",
+        "pdeath-cpu",
+        "pending",
+        "private-mask",
+        "host-signal",
+    ] {
+        for slice in ["2000", "5000"] {
+            let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+            let verdict = directory.path().join("verify.json");
+            let (status, log) = run_with_deadline(
+                hermit_command(&[
+                    "--log=info",
+                    "run",
+                    "--strict",
+                    "--verify",
+                    "--verify-strict",
+                    "--verify-json",
+                    verdict.to_str().unwrap(),
+                    "--target-timeslice",
+                    slice,
+                    "--timeout",
+                    "60",
+                    "--",
+                    guest,
+                    mode,
+                ]),
+                directory.path(),
+                Duration::from_secs(180),
+                false,
+            );
+            assert_eq!(
+                status.and_then(|status| status.code()),
+                Some(0),
+                "{mode}/{slice}:\n{log}"
+            );
+            let report: serde_json::Value =
+                serde_json::from_slice(&fs::read(&verdict).unwrap()).unwrap();
+            assert_eq!(report["bitwise_parity"], true, "{mode}/{slice}: {report}");
+        }
+    }
+}
+
+#[test]
+fn a_cross_process_caught_signal_refuses_competing_kernel_consumers() {
+    let _guard = hermit_run_guard();
+    let guest = process_signal_reservation_guest().to_str().unwrap();
+    for mode in ["waiter", "signalfd"] {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let (status, log) = run_with_deadline(
+            hermit_command(&["run", "--strict", "--timeout", "60", "--", guest, mode]),
+            directory.path(),
+            Duration::from_secs(120),
+            false,
+        );
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{mode}:\n{log}"
+        );
+        let attempt = fs::read(directory.path().join("deadline-run.stdout")).unwrap();
+        let (sender, target, signal): (i32, i32, i32) =
+            serde_json::from_slice(&attempt).expect("fixture must reach the cross-process send");
+        assert_ne!(
+            sender, target,
+            "{mode}: refusal must concern another process"
+        );
+        assert_eq!(signal, libc::SIGUSR1);
+    }
+}
+
 /// A process-directed signal a thread sends to its own multi-threaded process
 /// goes to the sender, before `kill` returns, exactly as Linux delivers it,
 /// when the schedule fixes the kernel's choice and the sender's dequeue
@@ -44684,6 +44921,40 @@ fn a_vfork_child_waiting_for_another_thread_completes_at_bitwise_parity() {
     }
 }
 
+#[test]
+fn a_vfork_exec_cpu_child_does_not_starve_its_parent() {
+    static GUEST: OnceLock<PathBuf> = OnceLock::new();
+    let guest = futex_c_guest(&GUEST, "vfork_exec_fairness");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let verdict = directory.path().join("verify.json");
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "--log=info",
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            verdict.to_str().unwrap(),
+            "--timeout",
+            "20",
+            "--",
+            guest.to_str().unwrap(),
+        ]),
+        directory.path(),
+        Duration::from_secs(60),
+        false,
+    );
+    assert_eq!(status.and_then(|status| status.code()), Some(0), "{log}");
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout")).unwrap();
+    assert_eq!(
+        stdout,
+        "parent serviced ready pipe while exec child was CPU-busy\n"
+    );
+    let report: serde_json::Value = serde_json::from_slice(&fs::read(verdict).unwrap()).unwrap();
+    assert_eq!(report["bitwise_parity"], true, "{report}");
+}
+
 /// get_mempolicy answers the questions libnuma asks as a Linux machine with one
 /// NUMA node does (https://github.com/rrnewton/hermit/issues/4214):
 /// `MPOL_F_MEMS_ALLOWED` fills the node mask with node 0 alone, as
@@ -45240,21 +45511,21 @@ fn a_pidfd_signal_to_a_sleeping_sibling_is_refused_by_name() {
 /// the same answer (it returned ENOSYS before). `kill(INT_MIN, sig)` is ESRCH
 /// in Linux, SIGKILL included, and Hermit forwards it rather than overflowing
 /// on its negation (the process-group SIGKILL arm negates the pid too).
-/// `kill(0, sig)`, `kill(-pgrp, sig)` and `kill(-1, sig)` signal every process
-/// in a set, which Detcore does not model:
-/// - a fail-closed run stops with the policy-refusal status at `kill(0)` and
-///   names it (it returned ENOSYS as a plain errno before);
-/// - `--allow-unsupported-syscalls` returns ENOSYS for each and names each
-///   refusal with its target.
+/// Modeled `kill(0, sig)` and `kill(-pgrp, sig)` deliver to the guest, while
+/// `kill(-1, sig)` remains an unsupported broadcast. Strict runs stop only at
+/// that broadcast; permissive runs return ENOSYS without suppressing either
+/// preceding group signal.
 #[test]
-fn a_signal_to_a_process_group_is_refused_by_name() {
+fn modeled_process_group_signals_deliver_but_broadcast_is_refused() {
     let guest = kill_process_group_guest().to_str().unwrap().to_owned();
     let answered = "own group: yes\n\
                     rt_sigqueueinfo(0): -1 ESRCH, handled 0\n\
                     rt_sigqueueinfo(-pgrp): -1 ESRCH, handled 0\n\
                     rt_sigqueueinfo(-1): -1 ESRCH, handled 0\n\
                     kill(INT_MIN): -1 ESRCH, handled 0\n\
-                    kill(INT_MIN, SIGKILL): -1 ESRCH, handled 0\n";
+                    kill(INT_MIN, SIGKILL): -1 ESRCH, handled 0\n\
+                    kill(0): 0, handled 1\n\
+                    kill(-pgrp): 0, handled 2\n";
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let (status, log) = run_with_deadline(
         hermit_command(&[
@@ -45277,10 +45548,6 @@ fn a_signal_to_a_process_group_is_refused_by_name() {
         status.and_then(|status| status.code()),
         Some(HERMIT_POLICY_REFUSAL_EXIT),
         "a fail-closed run must stop with the policy-refusal status:\nstdout:\n{stdout}\nstderr:\n{log}"
-    );
-    assert!(
-        log.contains("signal 10 to its own process group by kill is not supported"),
-        "the refusal must name the call and its target:\nstderr:\n{log}"
     );
     assert_eq!(stdout, answered, "stderr:\n{log}");
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -45308,25 +45575,9 @@ fn a_signal_to_a_process_group_is_refused_by_name() {
     );
     assert_eq!(
         stdout,
-        format!(
-            "{answered}kill(0): -1 ENOSYS, handled 0\n\
-             kill(-pgrp): -1 ENOSYS, handled 0\n\
-             kill(-1): -1 ENOSYS, handled 0\n"
-        ),
+        format!("{answered}kill(-1): -1 ENOSYS, handled 2\n"),
         "stderr:\n{log}"
     );
-    for target in [
-        "its own process group",
-        "process group 3",
-        "every process it may signal",
-    ] {
-        assert_eq!(
-            log.matches(&format!("signal 10 to {target} by kill is not supported"))
-                .count(),
-            1,
-            "the compatibility run must name the refusal for {target}:\nstderr:\n{log}"
-        );
-    }
 }
 
 /// Under `--no-sequentialize-threads` a `kill` to a process group or to every

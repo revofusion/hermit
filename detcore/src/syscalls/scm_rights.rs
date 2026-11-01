@@ -1586,12 +1586,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         from: ReceivedFrom,
     ) -> Result<Vec<RawFd>, Error> {
         match self.receipt_mode(guest) {
-            ReceiptMode::Discovered => return Ok(Vec::new()),
+            ReceiptMode::Discovered => {
+                if !delivered.fds.is_empty() || delivered.refused.is_some() {
+                    Self::withdraw_flock_custody(guest);
+                }
+                return Ok(Vec::new());
+            }
             ReceiptMode::Unrecorded(why) => {
                 if !delivered.fds.is_empty() || delivered.refused.is_some() {
                     // A listing of this table cannot come from the model now
                     // (`syscalls::files::descriptor_directory`).
                     guest.thread_state().note_unaccounted_receipt();
+                    Self::withdraw_flock_custody(guest);
                 }
                 if !delivered.fds.is_empty() {
                     debug!(
@@ -1605,6 +1611,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         if let Some(reason) = delivered.refused {
             guest.thread_state().note_unaccounted_receipt();
+            Self::withdraw_flock_custody(guest);
             warn!(
                 "[detcore] the descriptors a receive got {channel}, if any, are not recorded: \
                  {reason}"
@@ -1616,6 +1623,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             self.lose_lockstep_if_queued(guest, from, from.messages);
             if !delivered.fds.is_empty() {
                 guest.thread_state().note_unaccounted_receipt();
+                Self::withdraw_flock_custody(guest);
                 warn!(
                     "[detcore] descriptors {:?}, received {channel} on the background path, are \
                      not recorded: another task may have closed or replaced their numbers, or \
@@ -1663,6 +1671,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .unwrap_or_default();
             // The messages before it, which calls Detcore could not match took,
             // are released with this receipt.
+            if !forgotten.is_empty() {
+                Self::withdraw_flock_custody(guest);
+            }
             guest.thread_state().defer_released_rights(forgotten);
             let mut joined = vec![false; sent.len()];
             for (index, (&fd, facts)) in fds.iter().zip(facts).enumerate() {
@@ -1708,6 +1719,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                     }
                 }
             }
+            if joined.get(..fds.len()).is_none_or(|received| received.iter().any(|joined| !joined)) {
+                // A delivered native OFD did not inherit its sender's model.
+                // Later close/unlock could otherwise strand an indexed waiter.
+                Self::withdraw_flock_custody(guest);
+            }
             // What the message held and did not hand to this table goes with
             // it: the descriptors Linux could not install (`MSG_CTRUNC`) and
             // those this receipt recorded as open files of their own. A peek
@@ -1723,6 +1739,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         }
         Ok(recorded)
+    }
+
+    fn withdraw_flock_custody<G: Guest<Self>>(guest: &G) {
+        if let Some(registry) = guest.local_state().and_then(|global| global.flock_waits.as_ref()) {
+            registry.disable();
+        }
     }
 
     /// The kernel's facts about descriptor `fd`, which Linux has just
@@ -3017,6 +3039,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 });
             }
             if descriptors.len() != fds.len() {
+                Self::withdraw_flock_custody(guest);
                 self.lose_peer_lockstep(guest, socket);
                 continue;
             }
@@ -3031,6 +3054,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     socket.queue_rights_to_peer(descriptors.take().unwrap_or_default(), bytes)
                 })
                 .ok();
+            if !matches!(queued, Some(Ok(()))) {
+                Self::withdraw_flock_custody(guest);
+            }
             // Not queued, nothing was counted, and the sender's descriptors
             // still hold what the message names.
             if matches!(queued, Some(Ok(()))) && !copies.is_empty() {

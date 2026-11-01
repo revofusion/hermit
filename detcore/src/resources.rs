@@ -808,6 +808,10 @@ pub struct Resources {
     /// the configuration fingerprint (revision 8 appended this field).
     #[serde(default)]
     pub(crate) zero_length_sleep: bool,
+    /// Generation snapshot preceding the last empty Linux probe. Only enabled
+    /// event-driven waits carry it; positional RPC layout appends new fields.
+    #[serde(default)]
+    pub(crate) io_dependencies: Option<Box<crate::event_driven_io::Snapshot>>,
 }
 
 impl fmt::Debug for Resources {
@@ -940,6 +944,7 @@ impl Resources {
             priority_row: None,
             slice_expired: false,
             zero_length_sleep: false,
+            io_dependencies: None,
         }
     }
 

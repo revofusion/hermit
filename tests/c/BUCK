@@ -60,6 +60,15 @@ cpp_binary(
     name = "epoll_determinism",
     srcs = ["epoll_determinism.c"],
     labels = ["autodeps2_generated"],
+    external_deps = [
+        ("glibc", None, "pthread"),
+    ],
+)
+
+cpp_binary(
+    name = "sigchld_progress",
+    srcs = ["sigchld_progress.c"],
+    labels = ["autodeps2_generated"],
 )
 
 cpp_binary(
@@ -179,5 +188,38 @@ cpp_binary(
 cpp_binary(
     name = "signal_determinism",
     srcs = ["signal_determinism.c"],
+    labels = ["autodeps2_generated"],
+)
+
+cpp_binary(
+    name = "sysv_shm",
+    srcs = ["sysv_shm.c"],
+    labels = ["autodeps2_generated"],
+)
+
+cpp_binary(
+    name = "process_group_delivery",
+    srcs = ["process_group_delivery.c"],
+    labels = ["autodeps2_generated"],
+)
+
+cpp_binary(
+    name = "connect_source_port",
+    srcs = ["connect_source_port.c"],
+    labels = ["autodeps2_generated"],
+)
+
+cpp_binary(
+    name = "process_signal_reservation",
+    srcs = ["process_signal_reservation.c"],
+    labels = ["autodeps2_generated"],
+    external_deps = [
+        ("glibc", None, "pthread"),
+    ],
+)
+
+cpp_binary(
+    name = "socket_dontwait",
+    srcs = ["socket_dontwait.c"],
     labels = ["autodeps2_generated"],
 )

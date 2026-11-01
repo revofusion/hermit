@@ -40,6 +40,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 
+use reverie::Errno;
 use tracing::info;
 
 use super::Scheduler;
@@ -66,12 +67,15 @@ struct Reservation {
     /// The target's real uid, read by the sender before the send, for the
     /// parent's `CLD_KILLED` siginfo.
     uid: u32,
-    /// Whether the victims include the sender's own process: such a send is
-    /// committed at the sender's `Exit` grant, before it is sent.
-    includes_sender: bool,
     /// Native group intents installed before the reservation reply can let
     /// the sender await or issue its kill. The registry retains late members.
-    input_freezes: Vec<reverie::reserved_input::InputFreezeCohort>,
+    input_freezes: BTreeMap<DetPid, reverie::reserved_input::InputFreezeCohort>,
+    /// Original targets, in pid order, including processes whose exit was
+    /// already granted and the sender even when it has no sibling threads.
+    processes: Vec<DetPid>,
+    /// The sender's own process, if selected: its send is committed at the
+    /// sender's `Exit` grant, before the physical self-send.
+    sender_process: Option<DetPid>,
 }
 
 /// A reserved send: its token, and whether the victims include the sender's
@@ -238,7 +242,7 @@ impl Scheduler {
         target: DetPid,
         uid: u32,
     ) -> Result<SigkillReservation, SigkillRefusal> {
-        self.reserve_sigkill_processes(sender, &[target], uid)
+        self.reserve_sigkill_processes(sender, vec![target], uid)
     }
 
     /// Reserve the victims of a `kill(-pgid, SIGKILL)` that `sender` is about
@@ -261,13 +265,15 @@ impl Scheduler {
             .filter(|process| self.live_process_threads(*process).next().is_some())
             .collect();
         members.sort();
-        self.reserve_sigkill_processes(sender, &members, uid)
+        self.reserve_sigkill_processes(sender, members, uid)
     }
 
+    /// `targets` is sorted by pid; ownership moves into the reservation so
+    /// partial group delivery can validate its selection without copying it.
     fn reserve_sigkill_processes(
         &mut self,
         sender: DetTid,
-        targets: &[DetPid],
+        targets: Vec<DetPid>,
         uid: u32,
     ) -> Result<SigkillReservation, SigkillRefusal> {
         if !retires_sigkill_at_the_kill_turn(&self.backend) {
@@ -278,7 +284,7 @@ impl Scheduler {
         }
         let mut victims = Vec::new();
         let mut includes_sender = false;
-        for target in targets {
+        for target in &targets {
             if !self.thread_tree.thread_group_leaders.contains(target) {
                 return Err(SigkillRefusal::NoTarget);
             }
@@ -321,7 +327,7 @@ impl Scheduler {
         }
         let token = self.sigkill.next_token;
         self.sigkill.next_token += 1;
-        let mut input_freezes = Vec::new();
+        let mut input_freezes = BTreeMap::new();
         if let Some(control) = &self.reserved_input_control {
             let mut frozen_processes = BTreeSet::new();
             for victim in &victims {
@@ -333,22 +339,30 @@ impl Scheduler {
                 let task = *self.reserved_input_tasks.get(&owner).unwrap_or_else(|| {
                     panic!("reserved-input SIGKILL reservation lacks native binding for {owner}")
                 });
-                input_freezes.push(control.freeze_group(task, !own).unwrap_or_else(|error| {
-                    panic!("reserved-input SIGKILL reservation freeze failed: {error}")
-                }));
+                input_freezes.insert(
+                    victim.process,
+                    control.freeze_group(task, !own).unwrap_or_else(|error| {
+                        panic!("reserved-input SIGKILL reservation freeze failed: {error}")
+                    }),
+                );
             }
         }
         for victim in &victims {
             self.sigkill.reserved.insert(victim.tid, token);
         }
+        let sender_process = includes_sender.then(|| {
+            self.registered_process(sender)
+                .expect("registered SIGKILL sender")
+        });
         self.sigkill.reservations.insert(
             token,
             Reservation {
                 victims,
                 sender,
                 uid,
-                includes_sender,
                 input_freezes,
+                processes: targets,
+                sender_process,
             },
         );
         Ok(SigkillReservation {
@@ -457,6 +471,92 @@ impl Scheduler {
         victims
     }
 
+    /// Keep only the selected processes of one reserved send. Physical sends
+    /// may have succeeded for only part of a group; those successes must still
+    /// retire as one cohort, while failures take the ordinary cancellation path.
+    /// A selected sender is committed later at its existing Exit boundary.
+    /// Invalid tokens, duplicate processes and foreign processes change nothing.
+    pub(crate) fn restrict_sigkill_processes(
+        &mut self,
+        token: u64,
+        mut processes: Vec<DetPid>,
+    ) -> Result<SigkillReservation, Errno> {
+        let reservation = self.sigkill.reservations.get(&token).ok_or(Errno::ESRCH)?;
+        processes.sort_unstable();
+        if processes.windows(2).any(|pair| pair[0] == pair[1])
+            || processes
+                .iter()
+                .any(|process| reservation.processes.binary_search(process).is_err())
+        {
+            return Err(Errno::EINVAL);
+        }
+        let mut reservation = self
+            .sigkill
+            .reservations
+            .remove(&token)
+            .expect("validated SIGKILL reservation");
+        let mut canceled = Vec::new();
+        reservation.victims.retain(|victim| {
+            if processes.binary_search(&victim.process).is_ok() {
+                true
+            } else {
+                canceled.push(*victim);
+                false
+            }
+        });
+        reservation.sender_process = reservation
+            .sender_process
+            .filter(|sender| processes.binary_search(sender).is_ok());
+        if let Some(control) = &self.reserved_input_control {
+            for (process, cohort) in std::mem::take(&mut reservation.input_freezes) {
+                if processes.binary_search(&process).is_ok() {
+                    reservation.input_freezes.insert(process, cohort);
+                } else if let Err(error) = control.cancel_freeze_before_effect(cohort) {
+                    assert_eq!(
+                        error.reason(),
+                        "input-retirement-has-native-effect",
+                        "reserved-input canceled-subset intent could not be accounted"
+                    );
+                }
+            }
+        }
+        reservation.processes = processes;
+        let includes_sender = reservation.sender_process.is_some();
+        // A failed member's later ordinary exit must not consume the stale
+        // snapshot captured for this send, including a canceled self-send.
+        self.sigkill.robust_lists.retain(|(tid, mm), (recorded_for, _)| {
+            *recorded_for != token
+                || reservation
+                    .victims
+                    .iter()
+                    .any(|victim| victim.tid == *tid && victim.mm == *mm)
+                || (includes_sender && *tid == reservation.sender)
+        });
+        for victim in &canceled {
+            self.sigkill.reserved.remove(&victim.tid);
+        }
+        self.unwind_sigkill_victims(&canceled);
+        self.sigkill.reservations.insert(token, reservation);
+        Ok(SigkillReservation {
+            token,
+            includes_sender,
+        })
+    }
+
+    /// Release wakes and receipts held by a canceled reservation or subset.
+    fn unwind_sigkill_victims(&mut self, victims: &[SigkillVictim]) {
+        if victims.is_empty() {
+            return;
+        }
+        let tids: BTreeSet<DetTid> = victims.iter().map(|victim| victim.tid).collect();
+        self.run_retained_wakes_of(|tid| tids.contains(&tid));
+        for victim in victims {
+            if self.sigkill.held_receipts.remove(&victim.tid) {
+                self.logically_kill_thread(&victim.tid, &victim.process, victim.mm);
+            }
+        }
+    }
+
     /// Route a consuming receipt of `tid` (its deregistration, after its final
     /// accounting): see [`SigkillReceipt`].
     pub(crate) fn route_sigkill_receipt(&mut self, tid: DetTid) -> SigkillReceipt {
@@ -500,7 +600,7 @@ impl Scheduler {
         }
         if !sent {
             if let Some(control) = &self.reserved_input_control {
-                for cohort in reservation.input_freezes {
+                for cohort in reservation.input_freezes.into_values() {
                     // The native send failed and this reservation commits no
                     // logical retirement. Cancel only if the owned registry
                     // also proves no native terminal effect. A death already
@@ -520,13 +620,7 @@ impl Scheduler {
                 .retain(|_, (recorded_for, _)| *recorded_for != token);
             // No kill happened: wakes and a receipt that arrived meanwhile
             // take the ordinary path now.
-            let victims: BTreeSet<DetTid> = reservation.victims.iter().map(|v| v.tid).collect();
-            self.run_retained_wakes_of(|tid| victims.contains(&tid));
-            for victim in &reservation.victims {
-                if self.sigkill.held_receipts.remove(&victim.tid) {
-                    self.logically_kill_thread(&victim.tid, &victim.process, victim.mm);
-                }
-            }
+            self.unwind_sigkill_victims(&reservation.victims);
             return Vec::new();
         }
         // A victim that died before the commit (its receipt is held) may have
@@ -587,7 +681,12 @@ impl Scheduler {
         let cohort = (processes.len() > 1).then_some(token);
         for process in processes {
             if !already_notified.contains(&process) {
-                self.own_killed_child_notification(process, reservation.uid, cohort);
+                self.own_killed_child_notification(
+                    process,
+                    reservation.uid,
+                    cohort,
+                    reservation.sender,
+                );
             }
         }
         // A report the notification did not consume is forgotten, as
@@ -604,7 +703,13 @@ impl Scheduler {
     /// Linux's siginfo (`CLD_KILLED`, `SIGKILL`) on the scheduler's copy, and
     /// the child-exit timer. The first copy delivered stands for the exit
     /// (`child_exit_sigchld`).
-    fn own_killed_child_notification(&mut self, process: DetPid, uid: u32, cohort: Option<u64>) {
+    fn own_killed_child_notification(
+        &mut self,
+        process: DetPid,
+        uid: u32,
+        cohort: Option<u64>,
+        sender: DetTid,
+    ) {
         let Some(parent) = self.thread_tree.parent_process(&process) else {
             return;
         };
@@ -621,7 +726,7 @@ impl Scheduler {
             return;
         }
         let notification = if self.backend.reports_child_exit_publication {
-            self.classify_child_exit_notification(process, parent)
+            self.classify_child_exit_notification_with_sender(process, parent, Some(sender))
         } else {
             super::ChildExitNotification::Undecided
         };
@@ -750,7 +855,7 @@ impl Scheduler {
         self.sigkill
             .reservations
             .get(&token)
-            .is_some_and(|reservation| reservation.includes_sender)
+            .is_some_and(|reservation| reservation.sender_process.is_some())
     }
 
     /// Whether a committed send's `victims` are settled: each one's physical
@@ -833,7 +938,7 @@ impl Scheduler {
             .iter()
             .map(|victim| (victim.tid, victim.mm))
             .collect();
-        if reservation.includes_sender
+        if reservation.sender_process.is_some()
             && let Some(mm) = self.thread_mm(reservation.sender)
         {
             dying.push((reservation.sender, mm));
@@ -1270,7 +1375,7 @@ mod tests {
     }
 
     /// A process-group SIGKILL reserves and retires every live member, in pid
-    /// order; a group that contains the sender's own process is refused.
+    /// order; a selected sender is committed at its own Exit boundary.
     #[test]
     fn a_process_group_sigkill_retires_every_member() {
         let mut scheduler = family();
@@ -1301,6 +1406,163 @@ mod tests {
             [3, 4]
         );
         assert!(live(&scheduler, 2));
+    }
+
+    #[test]
+    fn restricting_a_sigkill_rejects_invalid_selections_without_changes() {
+        let mut scheduler = family();
+        let [root, sender, target, foreign] = [1, 2, 3, 99].map(DetPid::from_raw);
+        let group = DetPid::from_raw(77);
+        scheduler.thread_tree.set_process_group(root, group);
+        scheduler.thread_tree.set_process_group(target, group);
+        let reserved = scheduler.reserve_sigkill_group(sender, group, 0).unwrap();
+        let before = scheduler.sigkill.reserved.clone();
+        assert_eq!(
+            scheduler.restrict_sigkill_processes(u64::MAX, vec![target]),
+            Err(Errno::ESRCH)
+        );
+        for selection in [vec![target, target], vec![target, foreign]] {
+            assert_eq!(
+                scheduler.restrict_sigkill_processes(reserved.token, selection),
+                Err(Errno::EINVAL)
+            );
+            assert_eq!(scheduler.sigkill.reserved, before);
+            assert_eq!(
+                scheduler.sigkill.reservations[&reserved.token].processes,
+                [root, target]
+            );
+        }
+        let selected = scheduler
+            .restrict_sigkill_processes(reserved.token, vec![target, root])
+            .unwrap();
+        assert_eq!(selected, reserved);
+        assert_eq!(scheduler.commit_sigkill(selected.token, true).len(), 3);
+    }
+
+    #[test]
+    fn restricting_a_sigkill_drops_canceled_robust_snapshots() {
+        let mut scheduler = family();
+        let [root, sender, target] = [1, 2, 3].map(DetPid::from_raw);
+        let group = DetPid::from_raw(77);
+        for process in [root, sender, target] {
+            assert!(scheduler.thread_tree.set_process_group(process, group));
+        }
+        let reserved = scheduler.reserve_sigkill_group(sender, group, 0).unwrap();
+        let dying = scheduler.sigkill_dying_threads(reserved.token);
+        scheduler.record_sigkill_robust_lists(
+            reserved.token,
+            dying
+                .iter()
+                .map(|(tid, mm)| (*tid, *mm, RobustListSnapshot::default()))
+                .collect(),
+        );
+        let selected = scheduler
+            .restrict_sigkill_processes(reserved.token, vec![root])
+            .unwrap();
+        assert!(!selected.includes_sender);
+        assert_eq!(scheduler.sigkill_dying_threads(selected.token).len(), 1);
+        for (tid, mm) in dying {
+            assert_eq!(
+                scheduler.take_sigkill_robust_list(tid, mm).is_some(),
+                tid == root,
+            );
+        }
+    }
+
+    #[test]
+    fn restricting_a_sigkill_unwinds_canceled_receipts_and_commits_successes() {
+        let mut scheduler = family();
+        let [root, sender, target, worker] = [1, 2, 3, 4].map(DetPid::from_raw);
+        let group = DetPid::from_raw(77);
+        scheduler.thread_tree.set_process_group(root, group);
+        scheduler.thread_tree.set_process_group(target, group);
+        let reserved = scheduler.reserve_sigkill_group(sender, group, 0).unwrap();
+        assert_eq!(
+            scheduler.route_sigkill_receipt(worker),
+            SigkillReceipt::Held
+        );
+        let selected = scheduler
+            .restrict_sigkill_processes(reserved.token, vec![root])
+            .unwrap();
+        assert_eq!(selected.token, reserved.token);
+        assert!(live(&scheduler, 1) && live(&scheduler, 3));
+        assert!(
+            !live(&scheduler, 4),
+            "canceled receipt takes the ordinary path"
+        );
+        assert!(!scheduler.sigkill.reserved.contains_key(&target));
+        assert!(!scheduler.sigkill.reserved.contains_key(&worker));
+        assert_eq!(
+            scheduler.restrict_sigkill_processes(reserved.token, vec![root, target]),
+            Err(Errno::EINVAL),
+            "a canceled process cannot be reintroduced"
+        );
+        let victims = scheduler.commit_sigkill(selected.token, true);
+        assert_eq!(
+            victims.iter().map(|victim| victim.tid).collect::<Vec<_>>(),
+            [root]
+        );
+        assert!(!live(&scheduler, 1));
+        assert!(live(&scheduler, 2) && live(&scheduler, 3));
+    }
+
+    #[test]
+    fn restricting_a_sigkill_recomputes_sender_inclusion_including_empty_selection() {
+        let [sender, target] = [2, 3].map(DetPid::from_raw);
+        for processes in [vec![sender, target], vec![target], vec![sender], vec![]] {
+            let mut scheduler = family();
+            let group = DetPid::from_raw(77);
+            scheduler.thread_tree.set_process_group(sender, group);
+            scheduler.thread_tree.set_process_group(target, group);
+            let reserved = scheduler.reserve_sigkill_group(sender, group, 0).unwrap();
+            assert!(reserved.includes_sender);
+            let includes_sender = processes.contains(&sender);
+            let includes_target = processes.contains(&target);
+            let selected = scheduler
+                .restrict_sigkill_processes(reserved.token, processes)
+                .unwrap();
+            assert_eq!(selected.includes_sender, includes_sender);
+            assert_eq!(
+                scheduler.sigkill_reservation_includes_sender(selected.token),
+                includes_sender
+            );
+            let victims = scheduler.commit_sigkill(selected.token, true);
+            assert_eq!(victims.len(), if includes_target { 2 } else { 0 });
+            assert!(
+                live(&scheduler, 2),
+                "the sender keeps its controlled Exit path"
+            );
+            assert_eq!(live(&scheduler, 3), !includes_target);
+            assert_eq!(live(&scheduler, 4), !includes_target);
+            assert!(scheduler.sigkill.reserved.is_empty());
+            assert!(!scheduler.sigkill.reservations.contains_key(&selected.token));
+        }
+    }
+
+    #[test]
+    fn restricting_a_sigkill_accepts_reserved_processes_with_prior_exit_grants() {
+        let mut scheduler = family();
+        let [root, sender, target] = [1, 2, 3].map(DetPid::from_raw);
+        let group = DetPid::from_raw(77);
+        scheduler.thread_tree.set_process_group(root, group);
+        scheduler.thread_tree.set_process_group(target, group);
+        scheduler.thread_tree.granted_exits.insert(root);
+        let reserved = scheduler.reserve_sigkill_group(sender, group, 0).unwrap();
+        let selected = scheduler
+            .restrict_sigkill_processes(reserved.token, vec![root, target])
+            .unwrap();
+        let victims = scheduler.commit_sigkill(selected.token, true);
+        assert_eq!(
+            victims
+                .iter()
+                .map(|victim| victim.tid.as_raw())
+                .collect::<Vec<_>>(),
+            [3, 4]
+        );
+        assert!(
+            live(&scheduler, 1),
+            "the prior Exit grant retains ownership"
+        );
     }
 
     /// A PID namespace's init may ignore the SIGKILL, so a send that would

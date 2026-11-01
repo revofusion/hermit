@@ -6079,6 +6079,41 @@ fn signal_at_is_refused_where_it_would_not_reach_the_guest() {
     }
 }
 
+#[test]
+fn event_driven_io_refuses_unowned_readiness_and_legacy_schedules() {
+    for extra in [
+        "--network=host",
+        "--no-sequentialize-threads",
+        "--sched-heuristic=random",
+        "--debug-externalize-sockets",
+        "--record-preemptions",
+        "--record-preemptions-to=/tmp/event-driven-record.json",
+        "--replay-schedule-from=/tmp/event-driven-record.json",
+        "--replay-preemptions-from=/tmp/event-driven-record.json",
+    ] {
+        let mut opts =
+            RunOpts::parse_from(["hermit", "--event-driven-io", extra, "fakeprog"]);
+        assert!(
+            opts.validate_args_with_perf_support(true).is_err(),
+            "unsafe event-driven combination accepted: {extra}"
+        );
+    }
+    for backend in ["dbt", "kvm", "sabre", "e9patch", "liteinst"] {
+        let flag = format!("--backend={backend}");
+        let mut opts = run_opts_for(&[
+            "hermit",
+            &flag,
+            "run",
+            "--event-driven-io",
+            "fakeprog",
+        ]);
+        assert!(
+            opts.validate_args_with_perf_support(true).is_err(),
+            "unsupported event-driven backend accepted: {backend}"
+        );
+    }
+}
+
 /// `--pipe-wake-latency` parses, is rendered into the reproduce command and
 /// round-trips, keeping `0` distinct from unset. It is refused wherever it
 /// would be ignored: without sequentialized threads, with `--namespace-only`
@@ -10896,6 +10931,44 @@ impl RunOpts {
                 );
             }
         }
+        if config.event_driven_io {
+            if backend != Backend::Ptrace
+                || self.namespace_only
+                || self.strace_only
+                || self.no_namespace
+                || !config.sequentialize_threads
+                || !config.sched_heuristic.is_priority_ordered()
+                || config.chaos
+                || config.in_guest_signal_delivery
+                || config.debug_externalize_sockets
+                || config.passthru_opt
+            {
+                anyhow::bail!(
+                    "--event-driven-io requires sequential native ptrace execution with \
+                     priority scheduling, complete syscall interception and native signal delivery"
+                );
+            }
+            if host_network_requested
+                || self.record_networking.is_some()
+                || self.replay_networking.is_some()
+            {
+                anyhow::bail!(
+                    "--event-driven-io requires isolated local networking, without network \
+                     recording or replay"
+                );
+            }
+            if config.recordreplay_modes
+                || config.record_preemptions
+                || config.record_preemptions_to.is_some()
+                || config.replay_preemptions_from.is_some()
+                || config.replay_schedule_from.is_some()
+            {
+                anyhow::bail!(
+                    "--event-driven-io changes the scheduling/time policy and cannot consume \
+                     or produce legacy schedule recordings"
+                );
+            }
+        }
         // `--pipe-wake-latency` reorders the turns of sequentialized threads
         // by priority (https://github.com/rrnewton/hermit/issues/4380). As for
         // `--futex-wake-yields`, every launch that would accept it and ignore
@@ -11132,6 +11205,12 @@ impl RunOpts {
             anyhow::bail!(
                 "the dbt backend cannot apply --scheduler-turn-cost: its runtime reads a frozen \
                  configuration form that predates the option"
+            );
+        }
+        if self.namespace_only && (config.virtual_uid != 0 || config.virtual_gid != 0) {
+            anyhow::bail!(
+                "--virtual-uid and --virtual-gid require Detcore; --namespace-only runs the \
+                 guest natively and cannot apply a virtual identity"
             );
         }
         if let Some(cpus) = config.virtual_cpus {
@@ -14055,6 +14134,12 @@ impl RunOpts {
     /// table (`IdentityGuard::record_plan`). A native exec domain's container
     /// follows the plan with its declared-input mounts, and has no table.
     fn container(&self, tmpfs: &Path) -> Result<(Container, IdentityGuard), Error> {
+        // Keep kernel file ownership consistent with the fixed guest identity.
+        // Mapping every caller to root makes a non-root guest reject its own files.
+        let identity = (
+            self.det_opts.det_config.virtual_uid,
+            self.det_opts.det_config.virtual_gid,
+        );
         // PROTOTYPE: when an OCI image is requested, the guest runs against the
         // image's materialized rootfs (deterministic file inputs) rather than
         // the host filesystem. This replaces the default namespace+mounts setup
@@ -14097,6 +14182,7 @@ impl RunOpts {
                 crate::container::ImageContainerOpts {
                     bind_kvm: self.runtime_backend() == Backend::Kvm,
                     workdir_binds: &workdir_binds,
+                    identity,
                 },
             )?;
             self.network
@@ -14107,6 +14193,7 @@ impl RunOpts {
         let mut container = namespace_container(
             self.pin_threads,
             self.det_opts.det_config.cpu_profile_source,
+            identity,
         );
         self.network
             .configure(&mut container, self.analyze_networking);
@@ -15996,6 +16083,16 @@ pub(super) fn complete_container_config(
     launch_workdir: Option<&Path>,
 ) -> Result<DetConfig, Error> {
     config.inherited_seccomp = detcore::InheritedSeccomp::measure();
+    // Always replace any stale/serialized receipt. Admission above already
+    // restricts this mode to fully traced native local-network execution.
+    config.event_driven_private_tmp = if config.event_driven_io {
+        identity_sources
+            .map(IdentityGuard::event_driven_private_tmp)
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
     // Each run of `--verify` is its own container, whose namespace numbers
     // its mounts afresh, so each builds its own table, from the same plan and
     // the same host facts. The table, the identity order and the namespace

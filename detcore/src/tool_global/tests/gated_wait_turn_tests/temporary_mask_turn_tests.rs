@@ -2010,14 +2010,31 @@ async fn under_the_gate_an_unreadable_pselect6_argument_is_efault_only_where_lin
 /// copy reads the guest's sets first, so an unreadable set is EFAULT (the
 /// kernel's `get_fd_set`, fs/select.c:670-673), and only readable sets reach
 /// the named ENOSYS refusal, whose text names the EBADF a poll would find.
-/// The test process's descriptor table is grown past 1500 entries (a dup to
-/// descriptor 1500, closed after) so that FDSize admits 1501 descriptors.
+/// The test process's descriptor table is grown past 1500 entries so that
+/// FDSize admits 1501 descriptors. Run alone because that growth is shared
+/// by all threads and persists even after the owned descriptor is closed.
 /// Mutation "the refusal before the reads": the unreadable row gets ENOSYS.
 #[tokio::test]
 async fn under_the_gate_a_masked_pselect6_reads_its_sets_before_refusing_more_than_1024() {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    if !alone_in_child_process(
+        "under_the_gate_a_masked_pselect6_reads_its_sets_before_refusing_more_than_1024",
+    ) {
+        return;
+    }
     let term = bit(libc::SIGTERM);
-    // SAFETY: plain descriptor calls on this process.
-    assert_eq!(unsafe { libc::dup2(2, 1500) }, 1500);
+    let source = std::fs::File::open("/dev/null").unwrap();
+    // SAFETY: duplicate a live descriptor into an unused slot, never replacing
+    // a descriptor owned by the test harness.
+    let high_fd = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 1500) };
+    assert!(
+        high_fd >= 1500,
+        "the native test runner must allow descriptors above 1500: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: fcntl returned a fresh descriptor owned only by this test.
+    let _high_fd = unsafe { OwnedFd::from_raw_fd(high_fd) };
     let sets: &'static mut [u64; 32] = Box::leak(Box::new([0; 32]));
     let sets = sets as *mut [u64; 32] as usize;
     for (name, readfds, expected, warned) in [
@@ -2043,8 +2060,6 @@ async fn under_the_gate_a_masked_pselect6_reads_its_sets_before_refusing_more_th
         );
         assert!(guest.probe_masks.is_empty(), "{name}: no probe");
     }
-    // SAFETY: the descriptor dup'd above.
-    unsafe { libc::close(1500) };
 }
 
 /// Round-2 ruling 5: under the gate no timeslice runs, so a thread yields

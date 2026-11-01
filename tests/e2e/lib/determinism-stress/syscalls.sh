@@ -16,6 +16,16 @@ cases=(
   'epoll-nested|tests/c/epoll_determinism.c|nested'
   'epoll-control-fds|tests/c/epoll_determinism.c|control-fds'
   'epoll-dupfd|tests/c/epoll_determinism.c|dupfd'
+  'epoll-tcp-exit|tests/c/epoll_determinism.c|tcp-exit'
+  'epoll-tcp-exit-alias|tests/c/epoll_determinism.c|tcp-exit-alias'
+  'sigchld-progress|tests/c/sigchld_progress.c|'
+  'sigkill-group-progress|tests/c/sigkill_cross_process.c|parentgroup'
+  'connect-source-port|tests/c/connect_source_port.c|'
+  'connect-source-port-recycle|tests/c/connect_source_port.c|recycle'
+  'process-signal-unique|tests/c/process_signal_reservation.c|unique'
+  'process-signal-leader|tests/c/process_signal_reservation.c|leader'
+  'process-signal-restart|tests/c/process_signal_reservation.c|restart'
+  'process-signal-adversary|tests/c/process_signal_reservation.c|adversary'
   'mmap-multiple|tests/c/mmap_determinism.c|multiple'
   'mmap-fixed|tests/c/mmap_determinism.c|fixed'
   'mmap-heap|tests/c/mmap_determinism.c|heap'
@@ -42,6 +52,10 @@ for entry in "${cases[@]}"; do
         $source_file == tests/c/ipc_determinism.c ||
         $source_file == tests/c/resource_determinism.c ]]; then
     compile_flags+=(-D_GNU_SOURCE)
+  fi
+  if [[ $source_file == tests/c/epoll_determinism.c ||
+        $source_file == tests/c/sigkill_cross_process.c ]]; then
+    compile_flags+=(-pthread)
   fi
   guest=$(compile_c "$source_file" "syscall-$name" "${compile_flags[@]}")
   if ! verify_guest "syscall target: $name" "$guest" "${guest_args[@]}"; then

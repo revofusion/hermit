@@ -104,6 +104,10 @@ mod syscall_histogram;
 mod syscall_hot_path_tests;
 mod syscall_time;
 mod syscalls;
+mod event_driven_io;
+mod private_socket_path;
+mod flock;
+mod socket_query;
 #[cfg(test)]
 mod test_pages;
 mod tool_global;
@@ -1930,6 +1934,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         signal: SigWrapper,
     ) -> Result<Option<SigWrapper>, Errno> {
+        if self.cfg.backend == reverie::BackendCapabilities::PTRACE
+            && self.cfg.models_signal_targets()
+        {
+            tool_global::process_signal_dequeue(guest).await;
+        }
         let stop = self.inbound_stop(guest);
         let Some(timer_entry) = self.inbound_dequeued(guest, signal).await? else {
             return Ok(None);
@@ -2525,16 +2534,26 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// The first one delivered for a child's exit stands for it, and a copy
     /// of either kind that arrives after it is not delivered. The scheduler's
     /// copy (`SI_USER` from this tracer) is delivered with the siginfo Linux
-    /// gives the parent. Any other `SIGCHLD` is delivered as it is.
+    /// gives the parent.
+    /// An ignored disposition consumes the notification without a delivery turn:
+    /// ptrace reports even default-ignored SIGCHLD, but parking that stop behind
+    /// runnable guest work can prevent its parent from ever making progress.
+    /// Caught signals and unreadable dispositions retain the delivery protocol.
     async fn child_exit_sigchld_delivers<G: Guest<Self>>(&self, guest: &mut G) -> bool {
         use scheduler::child_exit_sigchld::ChildExitSigchldAnswer;
         use scheduler::child_exit_sigchld::OwnCopy;
         let Some(info) = guest.signal_info() else {
             return true;
         };
-        // A delivery stop: a kept copy's `InboundSignal` request follows.
-        let control = scheduler::child_exit_sigchld::taken_control(&info, true);
-        match tool_global::child_exit_sigchld(guest, control).await {
+        let runs_handler = delivery_runs_handler(guest, libc::SIGCHLD);
+        // Settle the ledger even when Linux would ignore this delivery, without
+        // leaving a ready/attributed mark for a later, unrelated notification.
+        let control = scheduler::child_exit_sigchld::taken_control(&info, runs_handler);
+        let answer = tool_global::child_exit_sigchld(guest, control).await;
+        if !runs_handler {
+            return false;
+        }
+        match answer {
             ChildExitSigchldAnswer::Claimed(dropped) => !dropped,
             ChildExitSigchldAnswer::OwnCopy(OwnCopy::Duplicate) => false,
             ChildExitSigchldAnswer::OwnCopy(OwnCopy::Deliver(own))
@@ -5092,7 +5111,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                                 .memory_metadata
                                 .lock()
                                 .expect("memory metadata mutex poisoned")
-                                .clone(),
+                                .fork(
+                                    dettid.as_raw(),
+                                    pts.1
+                                        .peek_guest_clock(pts.1.thread_logical_time.as_nanos())
+                                        .as_secs() as i64,
+                                ),
                         ))
                     },
                     pedigree: child_pedigree.clone(),
@@ -6036,6 +6060,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             } else {
                 Vec::new()
             };
+            let io_binding_changes = crate::event_driven_io::before_syscall(guest, call).await;
 
             // Only an emulated RNG readv supplies authoritative imported geometry.
             // A generic pre-dispatch snapshot would become stale across pipe waits.
@@ -6107,6 +6132,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                             },
                         },
                     },
+
                 }
             } else {
                 None
@@ -6126,6 +6152,28 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 _ if sigalrm_refusal.is_some() => {
                     syscall_histogram::mark_refused::<T, _>(guest);
                     Err(sigalrm_refusal.expect("checked").into())
+                }
+                _ if matches!(
+                    call.number(),
+                    Sysno::munmap | Sysno::mmap | Sysno::mremap | Sysno::madvise
+                ) && {
+                    let memory = guest
+                        .thread_state()
+                        .memory_metadata
+                        .lock()
+                        .expect("memory metadata mutex poisoned");
+                    syscalls::sysv_shm::changes_attachment(call, &memory.sysv_attachments)
+                } =>
+                {
+                    Err(Errno::EOPNOTSUPP.into())
+                }
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(pending-local-review): run-owned SysV backing,
+                // never host IPC. Other backends retain explicit ENOSYS.
+                SyscallClassification::Determinized
+                    if syscall_classification::is_sysv_shm(call.number()) =>
+                {
+                    Box::pin(self.handle_sysv_shm(guest, call)).await
                 }
                 _ if rendered_procfs_answer.is_some() => rendered_procfs_answer.expect("checked"),
                 SyscallClassification::PassThrough if call.number() == Sysno::chroot => {
@@ -6317,6 +6365,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         result
                     }
                 }
+
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(PR-860): Host LSM attributes are outside
                 // Detcore's model. Present a stable feature-absence boundary
@@ -6442,18 +6491,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#787): BATCH 38. The credential-setting family
                 // (setuid/setgid and their re-/res-/fs- variants, and setgroups) is
-                // untyped (Syscall::Other) in the pinned Reverie. Detcore presents a
-                // fixed virtual-root identity (getuid/geteuid/getgid/getegid are
-                // virtualized to 0) and never tracks a credential change, so these
-                // succeed as deterministic no-ops returning 0 -- the value a real root
-                // process gets for a permitted credential change (and the previous
-                // fs-id, virtual 0, for setfsuid/setfsgid). That lets privilege-
-                // dropping programs proceed instead of fail-closing and is identical
-                // across --verify and record/replay.
+                // a fixed-identity model. The historical virtual-root mode keeps
+                // its no-op behavior; a non-root identity permits only unchanged
+                // IDs and cannot claim a successful privilege transition.
                 SyscallClassification::Determinized
                     if is_credential_identity_noop_syscall(call.number()) =>
                 {
-                    Ok(0)
+                    self.handle_fixed_identity_change(call)
                 }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#1851): The file-ownership mutation family
@@ -7179,17 +7223,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
                     // AUTONOMOUS-BOT-IMPLEMENTED
                     // TODO-HUMAN-REVIEW(#1549): Credential-query
-                    // family emulated to the fixed virtual-root identity (0). See
-                    // syscall_classification.rs for the determinism rationale.
-                    // getuid/geteuid/getgid/getegid return the constant directly;
-                    // getresuid/getresgid write the constant to each provided result
-                    // pointer. Never forwarded to the host, so the answer no longer
-                    // depends on whether the backend runs the guest in a
+                    // family emulated to the configured fixed guest identity.
+                    // Queries never change host credentials or grant privileges.
+                    // The defaults remain virtual root, independent of the
                     // CLONE_NEWUSER namespace.
-                    Syscall::Getuid(_)
-                    | Syscall::Geteuid(_)
-                    | Syscall::Getgid(_)
-                    | Syscall::Getegid(_) => Ok(0),
+                    Syscall::Getuid(_) | Syscall::Geteuid(_) => Ok(i64::from(self.cfg.virtual_uid)),
+                    Syscall::Getgid(_) | Syscall::Getegid(_) => Ok(i64::from(self.cfg.virtual_gid)),
                     Syscall::Getresuid(s) => self.handle_getresuid(guest, s).await,
                     Syscall::Getresgid(s) => self.handle_getresgid(guest, s).await,
                     Syscall::RtSigprocmask(s) => self.handle_rt_sigprocmask(guest, s).await,
@@ -7397,6 +7436,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             {
                 self.note_fd_readied(guest, fd, wants).await;
             }
+            crate::event_driven_io::after_epoll_progress(guest, call, &res).await;
+            if !io_binding_changes.is_empty() {
+                crate::tool_global::event_driven_io(
+                    guest, crate::event_driven_io::Update::Change(io_binding_changes),
+                ).await;
+            }
             if crate::fifo_peer::any_orphaned_page() {
                 // Boxed: a rare cleanup, kept out of every syscall's future
                 // (`hot_path_futures_stay_small`).
@@ -7573,6 +7618,21 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         exit_status: ExitStatus,
     ) -> Result<(), Error> {
         let dettid = thread_state.dettid;
+        {
+            let memory = &thread_state.memory_metadata;
+            let mut metadata = memory.lock().expect("memory metadata mutex poisoned");
+            metadata.sysv_context(
+                thread_state.detpid.unwrap_or(self.detpid).as_raw(),
+                thread_state
+                    .peek_guest_clock(thread_state.thread_logical_time.as_nanos())
+                    .as_secs() as i64,
+            );
+            // Publish last-mm detach before a waiter's next IPC_STAT, not at
+            // the end of this hook's asynchronous scheduler cleanup.
+            if Arc::strong_count(memory) == 1 {
+                metadata.sysv_attachments.clear();
+            }
+        }
         thread_state.delivery_counters.log(dettid);
         // Its kept /proc status file reads only ESRCH from now on.
         crate::syscalls::forget_thread_status(Pid::from_raw(tid.as_raw()));

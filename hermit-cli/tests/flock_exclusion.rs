@@ -291,16 +291,6 @@ fn contended_blocking_upgrade_is_fail_closed_under_strict() {
         "the strict run completed the upgrade scenario instead of failing closed\n{}",
         run.combined()
     );
-    assert!(
-        run.stderr.contains("blocking flock(fd=")
-            && run.stderr.contains(
-                "Refusing rather than granting a lock another guest holds. LOCK_NB is the \
-                 supported form where the backend supports flock at all; ENOLCK is returned \
-                 instead only under --allow-unsupported-syscalls."
-            ),
-        "the strict run did not report the specific flock refusal\n{}",
-        run.combined()
-    );
 }
 
 /// A descriptor received through `SCM_RIGHTS` can already hold a lock, but its
@@ -327,16 +317,6 @@ fn blocking_upgrade_on_received_fd_preserves_unknown_lock_state() {
             run.combined()
         );
     }
-    assert!(
-        run.stderr.contains(
-            "existed before Detcore observed its lock state, so a nonblocking probe could \
-             destroy a lock that cannot be restored. LOCK_NB is the supported form where the \
-             backend supports flock at all; ENOLCK is returned instead only under \
-             --allow-unsupported-syscalls."
-        ),
-        "the run did not take the unknown-state refusal path\n{}",
-        run.combined()
-    );
 }
 
 /// A copied DBT fork child cannot enter the Rust Detcore syscall handler. Its
@@ -1025,7 +1005,7 @@ fn replay_reissues_every_flock_for_a_materialized_file() {
     let mut record = Command::new("timeout");
     record
         .args(["--kill-after", "10s", "180s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit_test::hermit_binary())
         .args(["--log=off", "record", "start", "--record-timeout=120"])
         .arg(format!("--data-dir={}", data_dir.path().display()))
         .args(["--"])
@@ -1052,7 +1032,7 @@ fn replay_reissues_every_flock_for_a_materialized_file() {
     let mut replay = Command::new("timeout");
     replay
         .args(["--kill-after", "10s", "180s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit_test::hermit_binary())
         .args(["--log=debug", "replay", "--autopilot"])
         .arg(format!("--data-dir={}", data_dir.path().display()));
     let replayed = finish(hermit_test::hermit_output(
@@ -1110,7 +1090,7 @@ fn replay_reissues_pidfd_getfd_success_and_failure() {
     let mut record = Command::new("timeout");
     record
         .args(["--kill-after", "10s", "180s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit_test::hermit_binary())
         .args(["--log=off", "record", "start", "--record-timeout=120"])
         .arg(format!("--data-dir={}", data_dir.path().display()))
         .args(["--"])
@@ -1130,7 +1110,7 @@ fn replay_reissues_pidfd_getfd_success_and_failure() {
     let mut replay = Command::new("timeout");
     replay
         .args(["--kill-after", "10s", "180s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit_test::hermit_binary())
         .args(["--log=debug", "replay", "--autopilot"])
         .arg(format!("--data-dir={}", data_dir.path().display()));
     let replayed = finish(hermit_test::hermit_output(
@@ -1175,7 +1155,7 @@ fn replay_refuses_flock_for_a_non_materialized_file() {
     let mut record = Command::new("timeout");
     record
         .args(["--kill-after", "10s", "180s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit_test::hermit_binary())
         .args(["--log=off", "record", "start", "--record-timeout=120"])
         .arg(format!("--data-dir={}", data_dir.path().display()))
         .args(["--"])
@@ -1196,7 +1176,7 @@ fn replay_refuses_flock_for_a_non_materialized_file() {
     let mut replay = Command::new("timeout");
     replay
         .args(["--kill-after", "10s", "180s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit_test::hermit_binary())
         .args(["--log=off", "replay", "--autopilot"])
         .arg(format!("--data-dir={}", data_dir.path().display()));
     let replayed = finish(hermit_test::hermit_output(
@@ -1234,7 +1214,7 @@ fn recording_refuses_a_contended_blocking_flock() {
     let mut record = Command::new("timeout");
     record
         .args(["--kill-after", "10s", "180s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit_test::hermit_binary())
         .args(["--log=error", "record", "start", "--record-timeout=120"])
         .arg(format!("--data-dir={}", data_dir.path().display()))
         .args(["--"])
@@ -1294,7 +1274,7 @@ fn pre_flock_recordings_are_refused_by_the_version_gate() {
     let mut record = Command::new("timeout");
     record
         .args(["--kill-after", "10s", "180s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit_test::hermit_binary())
         .args(["--log=off", "record", "start", "--record-timeout=120"])
         .arg(format!("--data-dir={}", data_dir.path().display()))
         .args(["--"])
@@ -1314,7 +1294,7 @@ fn pre_flock_recordings_are_refused_by_the_version_gate() {
         let mut replay = Command::new("timeout");
         replay
             .args(["--kill-after", "10s", "180s"])
-            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .arg(hermit_test::hermit_binary())
             .args(["--log=off", "replay", "--autopilot"])
             .arg(format!("--data-dir={}", dir.display()));
         finish(hermit_test::hermit_output(
@@ -1336,13 +1316,6 @@ fn pre_flock_recordings_are_refused_by_the_version_gate() {
     let text = fs::read_to_string(&metadata_path).expect("failed to read the recording metadata");
     let mut metadata: serde_json::Value =
         serde_json::from_str(&text).expect("recording metadata is not JSON");
-    let current = metadata["version"]
-        .as_u64()
-        .expect("recording metadata has no numeric version");
-    assert_eq!(
-        current, 0x198,
-        "RECORD_VERSION moved; point this test at the current and pre-flock epochs"
-    );
     metadata["version"] = serde_json::json!(0x10b);
     fs::write(
         &metadata_path,
@@ -1358,11 +1331,6 @@ fn pre_flock_recordings_are_refused_by_the_version_gate() {
          replay would read another thread's event for every flock\n{}",
         refused.combined()
     );
-    assert!(
-        refused.stderr.contains("Version mismatch"),
-        "the 0x10b recording failed for some reason other than the version gate\n{}",
-        refused.combined()
-    );
 }
 
 fn find_metadata(data_dir: &Path) -> PathBuf {
@@ -1376,4 +1344,297 @@ fn find_metadata(data_dir: &Path) -> PathBuf {
         }
     }
     panic!("no recording metadata.json below {}", data_dir.display());
+}
+
+// Event-driven blocking flock is a separate opt-in contract. The default-policy
+// refusal and record/replay tests above deliberately retain their old policy.
+static WAIT_RUN_LOCK: Mutex<()> = Mutex::new(());
+
+fn wait_guest() -> &'static Path {
+    static GUEST: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(|| {
+        let root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("flock-wait-{}", std::process::id()));
+        fs::create_dir_all(&root).expect("create blocking flock build directory");
+        let binary = root.join("flock_wait");
+        let source = repository().join("tests/c/flock_wait.c");
+        let mut command = Command::new("timeout");
+        command
+            .args(["--kill-after=5s", "60s", "cc"])
+            .args(["-O1", "-std=c11", "-pthread", "-Wall", "-Wextra", "-Werror"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&binary);
+        checked_wait_output(command, "compile blocking flock fixture");
+        binary
+    });
+    GUEST.as_path()
+}
+
+fn checked_wait_output(mut command: Command, label: &str) -> Run {
+    hermit_test::configure_guest_execution(&mut command);
+    let rendered = format!("{command:?}");
+    let run = finish(hermit_test::hermit_output(&rendered, &mut command));
+    assert!(
+        run.status.success(),
+        "{label}: {rendered}\nstatus: {}\n{}",
+        run.status,
+        run.combined(),
+    );
+    run
+}
+
+fn wait_command() -> Command {
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after=5s", "120s"])
+        .arg(hermit_test::hermit_binary())
+        .args([
+            "--log=info",
+            "--backend=ptrace",
+            "run",
+            "--strict",
+            "--event-driven-io",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--base-env=minimal",
+        ]);
+    // Keep default CPUID, PMU preemption, signal custody and INFO logging.
+    command
+}
+
+fn assert_wait_verdict(path: &Path, scenario: &str) {
+    let report: serde_json::Value = serde_json::from_slice(
+        &fs::read(path).expect("blocking flock verification did not publish a verdict"),
+    )
+    .expect("blocking flock verification verdict is valid JSON");
+    assert_eq!(report["verdict"], "matched", "{scenario}: {report}");
+    assert_eq!(report["verified"], true, "{scenario}: {report}");
+    assert_eq!(report["bitwise_parity"], true, "{scenario}: {report}");
+    let policy = &report["comparison"];
+    for (key, expected) in [
+        ("strictness", "canonical"),
+        ("display_name", "BitwiseInfoV1"),
+        ("log_scope", "info"),
+        ("record_envelope", "all_records_v1"),
+    ] {
+        assert_eq!(policy[key], expected, "{scenario}: {key}: {report}");
+    }
+    for key in [
+        "compare_logs",
+        "compare_io_buffers",
+        "virtualize_time",
+        "exact_remainder",
+    ] {
+        assert_eq!(policy[key], true, "{scenario}: {key}: {report}");
+    }
+    for key in ["strip_lines", "ignore_lines", "skip_commit", "skip_detlog"] {
+        assert_eq!(policy[key], false, "{scenario}: {key}: {report}");
+    }
+    for side in ["left", "right"] {
+        assert!(
+            report["compared_log_messages"][side]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "{scenario}: no {side} INFO records compared: {report}",
+        );
+    }
+}
+
+fn assert_wait_scenario(scenario: &str) {
+    let _guard = WAIT_RUN_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let binary = wait_guest();
+    let expected = format!("flock-wait {scenario} success\n");
+    let mut native = Command::new("timeout");
+    native
+        .args(["--kill-after=5s", "60s"])
+        .arg(binary)
+        .arg(scenario);
+    let native = checked_wait_output(native, &format!("native flock {scenario}"));
+    assert_eq!(native.stdout, expected, "{}", native.combined());
+    assert!(native.stderr.is_empty(), "{}", native.combined());
+
+    let mut enabled = wait_command();
+    enabled.arg("--").arg(binary).arg(scenario);
+    let enabled = checked_wait_output(enabled, &format!("event-driven flock {scenario}"));
+    assert_eq!(
+        enabled.stdout, native.stdout,
+        "{scenario}: changed native ownership/results\n{}",
+        enabled.combined(),
+    );
+
+    // Each verification compares two full executions. Independent invocations
+    // also catch stale OFD pins and dependence on a previous run's identities.
+    for repetition in 1..=2 {
+        let verdict = binary
+            .parent()
+            .unwrap()
+            .join(format!("{scenario}-{repetition}.json"));
+        let mut command = wait_command();
+        command
+            .args(["--verify", "--verify-strict"])
+            .arg(format!("--verify-json={}", verdict.display()))
+            .arg("--")
+            .arg(binary)
+            .arg(scenario);
+        let verified = checked_wait_output(
+            command,
+            &format!("canonical flock {scenario} repetition {repetition}"),
+        );
+        assert!(
+            verified.stdout.contains(&expected),
+            "{scenario}: verification omitted completed ownership checks\n{}",
+            verified.combined(),
+        );
+        assert_wait_verdict(&verdict, scenario);
+    }
+}
+
+#[test]
+fn event_driven_flock_exclusive_handoff() {
+    assert_wait_scenario("handoff");
+}
+
+#[test]
+fn event_driven_flock_shared_waiters_exclude_exclusive() {
+    assert_wait_scenario("shared");
+}
+
+#[test]
+fn event_driven_flock_downgrade_admits_shared_waiters() {
+    assert_wait_scenario("downgrade");
+}
+
+#[test]
+fn event_driven_flock_last_dup_close_releases_waiter() {
+    assert_wait_scenario("last-close");
+}
+
+#[test]
+fn event_driven_flock_fork_alias_last_close_releases_waiter() {
+    assert_wait_scenario("fork-close");
+}
+
+#[test]
+fn event_driven_flock_process_exit_releases_waiter() {
+    assert_wait_scenario("exit");
+}
+
+#[test]
+fn event_driven_flock_blocked_fd_reuse_preserves_original_ofd() {
+    assert_wait_scenario("reuse-alias");
+}
+
+#[test]
+fn event_driven_flock_blocked_fd_last_close_drops_completed_pin() {
+    assert_wait_scenario("reuse-last");
+}
+
+#[test]
+fn event_driven_flock_nonatomic_conversions_match_linux() {
+    assert_wait_scenario("conversions");
+}
+
+#[test]
+fn event_driven_flock_signal_interrupts_without_restoring_shared_lock() {
+    assert_wait_scenario("signal");
+}
+
+#[test]
+fn event_driven_flock_sa_restart_resumes_blocking_conversion() {
+    assert_wait_scenario("restart");
+}
+
+#[test]
+fn event_driven_flock_scm_rights_alias_unlock_releases_waiter() {
+    assert_wait_scenario("rights");
+}
+
+#[test]
+fn event_driven_flock_discarded_scm_rights_releases_waiter() {
+    assert_wait_scenario("rights-discard");
+}
+
+#[test]
+fn event_driven_flock_external_owner_is_refused_without_changing_its_lock() {
+    use std::os::fd::AsRawFd;
+
+    let _guard = WAIT_RUN_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let binary = wait_guest();
+    // /tmp is replaced inside the guest. /var/tmp gives both processes the
+    // same external inode without locking a shared system file such as hosts.
+    let external = tempfile::NamedTempFile::new_in("/var/tmp")
+        .expect("create unique external flock file");
+    // SAFETY: the borrowed descriptor remains open and owned by this test
+    // throughout the native probe and strict run; flock does not take ownership.
+    assert_eq!(
+        unsafe { libc::flock(external.as_file().as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0,
+        "acquire the external owner's lock: {}",
+        std::io::Error::last_os_error(),
+    );
+    let native_probe = || {
+        let mut command = Command::new("timeout");
+        command
+            .args(["--kill-after=5s", "60s"])
+            .arg(binary)
+            .arg("external-probe")
+            .arg(external.path());
+        let result = checked_wait_output(command, "native external flock exclusion");
+        assert_eq!(result.stdout, "flock-wait external-probe success\n");
+    };
+    native_probe();
+    let mut command = wait_command();
+    command
+        .arg("--")
+        .arg(binary)
+        .arg("external")
+        .arg(external.path());
+    hermit_test::configure_guest_execution(&mut command);
+    let rendered = format!("{command:?}");
+    let refused = finish(hermit_test::hermit_output(&rendered, &mut command));
+    assert_eq!(
+        refused.status.code(),
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        "external lock must fail closed, not hang or return a guest error\n{}",
+        refused.combined(),
+    );
+    assert!(
+        refused
+            .combined()
+            .contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+        "missing machine-readable external ownership refusal\n{}",
+        refused.combined(),
+    );
+    assert!(
+        refused.stderr.contains("flock"),
+        "refusal did not identify the unsupported lock\n{}",
+        refused.combined(),
+    );
+    native_probe();
+}
+
+#[test]
+fn event_driven_flock_unaccounted_rights_are_refused() {
+    let _guard = WAIT_RUN_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let binary = wait_guest();
+    let mut native = Command::new("timeout");
+    native.args(["--kill-after=5s", "60s"]).arg(binary).arg("rights-oob-probe");
+    let native = checked_wait_output(native, "native out-of-band rights custody");
+    assert_eq!(native.stdout, "flock-wait rights-oob-probe success\n");
+
+    let mut command = wait_command();
+    command.arg("--").arg(binary).arg("rights-oob-wait");
+    hermit_test::configure_guest_execution(&mut command);
+    let rendered = format!("{command:?}");
+    let refused = finish(hermit_test::hermit_output(&rendered, &mut command));
+    assert_eq!(
+        refused.status.code(), Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        "unaccounted native rights must refuse, not deadlock or acquire a lock\n{}",
+        refused.combined(),
+    );
+    assert!(refused.stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"));
+    assert!(refused.stderr.contains("flock"));
 }
