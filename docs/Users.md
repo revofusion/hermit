@@ -236,6 +236,33 @@ validity must also agree with it. Keep that epoch identical across repeats.
 Neither a leaf count nor a bootstrap-only repeat qualifies settlement: require
 the original bidirectional payment assertions as well.
 
+### Representative Spark diagnostics
+
+The private-lab sample requests the normal 1,024 leaves and constructs the
+first 15 of 65 subtrees with real services. Subtrees 1–10 warm the workload;
+11–15 form the measured window. The controller stops at a deterministic guest
+milestone before tree funding and emits `qualification=false`. Report startup,
+the measured window and teardown separately; do not call this settlement.
+The retained Legion recipe is
+`/var/tmp/hermit-wall-profile/run_subtree_sample_tmpfs.py`.
+
+Keep the guest working directory immutable and put captures outside its visible
+tree: directory enumeration otherwise observes earlier runs' output files.
+Live diagnostics also become inputs when services stat their logs. Compressed
+ZFS backing produced different `st_blocks` for identical guest writes; bounded
+tmpfs diagnostics removed that source of variation without changing PostgreSQL
+storage or durability. Tmpfs is volatile: preserve live logs and copy and
+byte-verify their archive after both successful and failed runs before reclaiming
+it. The recipe checks capacity and retains both the source and verified archive.
+
+A matching startup-only control is not full-sample repeatability. The corrected
+15-subtree pair still diverged on an interoperator native TCP read: a request for
+32,890 bytes returned 32,890 versus 24,780. Native TCP delivery is not modeled
+by Unix readiness generations. Bounded TCP controls did not reproduce this
+difference; its complete cause remains unresolved. Preserve the returned byte
+counts and buffer observations in strict comparison. Treat this sample as a
+performance diagnostic, not a qualified deterministic full-stack execution.
+
 ## Scheduler-owned file locks
 
 `hermit run --event-driven-io` supports blocking `flock` on native ptrace for
