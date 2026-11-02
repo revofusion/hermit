@@ -6,6 +6,11 @@ branches from 0.5.0.
 
 ## 0.5.3 (Unreleased)
 
+- Index frozen host-input mutation coverage in a borrowed, component-ordered
+  flat array. Bulk input-set, directory-digest and replay-finalization queries
+  use a binary search instead of scanning every mutation for every path.
+  Preserve lexical path semantics, complete mutation records and digests;
+  live observations retain the current mutable-set checks.
 - Bound captured stdout/stderr mismatch rendering to escaped-byte windows at the
   first difference, avoiding quadratic allocations for long lines or many
   lines. Exact byte comparison, complete output evidence and full log

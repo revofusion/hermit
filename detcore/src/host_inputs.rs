@@ -54,6 +54,42 @@ use sha2::Digest;
 use sha2::Sha256;
 use tracing::warn;
 
+/// Borrowed mutation coverage for a batch after the mutation set is frozen.
+/// The original records remain intact for the log and its digest.
+pub(crate) struct MutationRoots<'a> {
+    roots: Vec<&'a Path>,
+}
+
+impl<'a> MutationRoots<'a> {
+    pub(crate) fn new(mutated: &'a BTreeSet<String>) -> Self {
+        // Path ordering, unlike String ordering, compares the same lexical
+        // components as starts_with (including redundant separators and '.').
+        let mut roots: Vec<_> = mutated.iter().map(Path::new).collect();
+        roots.sort_unstable();
+        let mut retained = 0;
+        for index in 0..roots.len() {
+            let path = roots[index];
+            if retained == 0 || !path.starts_with(roots[retained - 1]) {
+                roots[retained] = path;
+                retained += 1;
+            }
+        }
+        roots.truncate(retained);
+        Self { roots }
+    }
+
+    fn guest_rebound(&self, path: &str) -> bool {
+        let path = Path::new(path);
+        if !path.is_absolute() {
+            return true;
+        }
+        // Descendants are contiguous in component order. Since no retained
+        // root is below another, only the predecessor can cover this path.
+        let end = self.roots.partition_point(|root| *root <= path);
+        end != 0 && path.starts_with(self.roots[end - 1])
+    }
+}
+
 /// Write `records` to `log`, one JSON line each, then one
 /// [`HostMutationRecord`] line for each path in `mutated`, followed by a
 /// [`HostInputLogEnd`] line naming how many lines precede it, so that a
@@ -98,10 +134,11 @@ pub(crate) fn input_set(records: &[HostInputRecord], mutated: &BTreeSet<String>)
     for record in records {
         first.entry(record.path.as_str()).or_insert(record);
     }
+    let mutated = MutationRoots::new(mutated);
     let files: Vec<HostInput> = first
         .into_iter()
         .filter(|(path, record)| {
-            !record.kernel_object && !is_kernel_object(path) && !guest_rebound(mutated, path)
+            !record.kernel_object && !is_kernel_object(path) && !mutated.guest_rebound(path)
         })
         .map(|(path, record)| HostInput {
             path: path.to_owned(),
@@ -151,7 +188,7 @@ pub(crate) fn content_at_end(
     source: &Path,
     path: &str,
     identity: HostFileIdentity,
-    mutated: &BTreeSet<String>,
+    mutated: &MutationRoots<'_>,
 ) -> Option<String> {
     let stat = crate::util::raw_stat(source).ok()?;
     match stat.st_mode & libc::S_IFMT {
@@ -216,7 +253,7 @@ fn read_digest(file: &crate::util::RawFd) -> Option<String> {
 fn directory_digest(
     directory: &crate::util::RawFd,
     path: &str,
-    mutated: &BTreeSet<String>,
+    mutated: &MutationRoots<'_>,
 ) -> Option<String> {
     let mut names = Vec::new();
     let mut total = 0_u64;
@@ -226,7 +263,7 @@ fn directory_digest(
             return Some(());
         }
         let child = Path::new(path).join(name);
-        if !guest_rebound(mutated, &child.to_string_lossy()) {
+        if !mutated.guest_rebound(&child.to_string_lossy()) {
             names.push(name.as_bytes().to_vec());
         }
         None
@@ -480,8 +517,9 @@ impl ReplayHostInputs {
         mutated: &BTreeSet<String>,
     ) -> &[HostInputChange] {
         let found = self.changes.len();
+        let mutated = MutationRoots::new(mutated);
         for (path, identity) in std::mem::take(&mut self.pending) {
-            if guest_rebound(mutated, &path) {
+            if mutated.guest_rebound(&path) {
                 continue;
             }
             let Some(recorded) = self.recorded.file(&path) else {
@@ -544,6 +582,32 @@ mod tests {
             content: None,
             exec: false,
             kernel_object: false,
+        }
+    }
+
+    #[test]
+    fn mutation_coverage_preserves_lexical_path_boundaries() {
+        let paths = [
+            "", "/", "//", "/a", "/ab", "/a/b", "/a/../b", "/a/./b", "/a//b/", ".", "./a", "a/b",
+            "../a", "/..", "/a/.", "/a/..", "/a-b", "/a0", "/a/b/c",
+        ];
+        let empty = BTreeSet::new();
+        let roots = MutationRoots::new(&empty);
+        for path in paths {
+            assert_eq!(roots.guest_rebound(path), guest_rebound(&empty, path));
+        }
+        for first in paths {
+            for second in paths {
+                let mutations = BTreeSet::from([first.to_owned(), second.to_owned()]);
+                let roots = MutationRoots::new(&mutations);
+                for path in paths {
+                    assert_eq!(
+                        roots.guest_rebound(path),
+                        guest_rebound(&mutations, path),
+                        "mutations={mutations:?}, path={path:?}",
+                    );
+                }
+            }
         }
     }
 
@@ -747,6 +811,7 @@ mod tests {
         let path = directory.path().join("F");
         std::fs::write(&path, "input\n").unwrap();
         let none = BTreeSet::new();
+        let none = MutationRoots::new(&none);
         let found = HostFileIdentity::from_stat(&crate::util::raw_stat(&path).unwrap());
         // `printf 'input\n' | sha256sum`
         let expected = "7d3f9b6284c6f36e77b425cac882e8fbbcc97a4727ec20790853076d0f463453";
@@ -787,6 +852,7 @@ mod tests {
         // directory's new size and times.
         std::fs::write(listed.path().join("made"), "").unwrap();
         let made = BTreeSet::from(["/tmp/made".to_owned()]);
+        let made = MutationRoots::new(&made);
         assert_eq!(
             content_at_end(listed.path(), "/tmp", at(listed.path()), &made).as_deref(),
             Some(names.as_str())

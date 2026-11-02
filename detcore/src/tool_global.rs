@@ -2543,6 +2543,7 @@ impl GlobalState {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
+        let mutation_roots = crate::host_inputs::MutationRoots::new(&mutated);
         let sources = std::mem::take(
             &mut *self
                 .host_input_sources
@@ -2563,8 +2564,12 @@ impl GlobalState {
             if first.get(&record.path) != Some(index) {
                 continue;
             }
-            record.content =
-                crate::host_inputs::content_at_end(source, &record.path, *physical, &mutated);
+            record.content = crate::host_inputs::content_at_end(
+                source,
+                &record.path,
+                *physical,
+                &mutation_roots,
+            );
             if record.identity != *physical {
                 let authenticated = self.cfg.host_input_snapshots.iter().any(|snapshot| {
                     snapshot.physical == *physical

@@ -267,6 +267,14 @@ difference; its complete cause remains unresolved. Preserve the returned byte
 counts and buffer observations in strict comparison. Treat this sample as a
 performance diagnostic, not a qualified deterministic full-stack execution.
 
+Host-input finalization is a separate cost from service startup and subtree
+execution. Once mutations are frozen, Hermit builds a borrowed, sorted array
+of non-overlapping mutation roots and uses component-wise binary searches for
+bulk input and directory-entry checks. It does not cache file contents or
+query results: the complete mutation log, content digests, relative-path
+refusal and lexical `Path` semantics remain unchanged. This removes repeated
+whole-mutation-set scans during finalization, not guest workload actions.
+
 ## Scheduler-owned file locks
 
 `hermit run --event-driven-io` supports blocking `flock` on native ptrace for
