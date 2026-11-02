@@ -59,6 +59,10 @@ divergent record/syscall/scheduler coordinates retain their existing semantics.
 A diagnostic limit limits rendering, not the amount verified; `--print-logs`
 prints side-labeled canonical records as they are compared. Captured stdout
 and stderr are still compared byte for byte.
+Output mismatches show the first differing byte offset and bounded escaped-byte
+windows, rather than computing a potentially quadratic text edit distance.
+Complete output hashes and byte counts are retained, and the subsequent log
+comparison still validates both complete traces.
 
 Native validation compared a differing 21-million-INFO-record pair completely
 in 113 seconds with 118 MiB peak RSS; a matching 3,804,781-record pair passed

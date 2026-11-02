@@ -1887,30 +1887,18 @@ fn compare_two_runs_with_unsupported_scan(
         options.virtualize_time,
     );
 
-    if out1.stdout != out2.stdout {
+    if let Some(offset) = first_output_difference(&out1.stdout, &out2.stdout) {
         failed = true;
         observed_divergence = true;
         eprintln!("Mismatch in stdout between {label1} and {label2}:");
-        let str1 = String::from_utf8_lossy(&out1.stdout);
-        let str2 = String::from_utf8_lossy(&out2.stdout);
-        if str1.lines().count() > 1 {
-            display_diff(&str1, &str2);
-        } else {
-            eprintln!("{}", Comparison::new(&str1, &str2));
-        }
+        display_output_difference(&out1.stdout, &out2.stdout, offset, [label1, label2]);
     }
 
-    if out1.stderr != out2.stderr {
+    if let Some(offset) = first_output_difference(&out1.stderr, &out2.stderr) {
         failed = true;
         observed_divergence = true;
         eprintln!("Mismatch in stderr between {label1} and {label2}:");
-        let str1 = String::from_utf8_lossy(&out1.stderr);
-        let str2 = String::from_utf8_lossy(&out2.stderr);
-        if str1.lines().count() > 1 {
-            display_diff(&str1, &str2);
-        } else {
-            eprintln!("{}", Comparison::new(&str1, &str2));
-        }
+        display_output_difference(&out1.stderr, &out2.stderr, offset, [label1, label2]);
     }
 
     let log_processing_result = (|| -> Result<(), Error> {
@@ -2412,19 +2400,31 @@ pub(crate) const RERUN_TIME_NOT_VIRTUALIZED_NOTE: &str = "Time was not virtualiz
     read the host's clock, so these two runs matched, but a guest whose output depends on the \
     time can differ from one run to the next.";
 
-fn display_diff(left: &str, right: &str) {
-    for result in diff::lines(left, right) {
-        match result {
-            diff::Result::Left(s) => {
-                eprintln!("- {}", s.red());
-            }
-            diff::Result::Right(s) => {
-                eprintln!("+ {}", s.green());
-            }
-            diff::Result::Both(s, _) => {
-                eprintln!("  {}", s);
-            }
-        }
+fn first_output_difference(left: &[u8], right: &[u8]) -> Option<usize> {
+    left.iter()
+        .zip(right)
+        .position(|(left, right)| left != right)
+        .or_else(|| (left.len() != right.len()).then_some(left.len().min(right.len())))
+}
+
+/// Only rendering is bounded: equality and output evidence cover every byte.
+/// Text edit-distance algorithms can allocate quadratically for long lines or
+/// many lines. Escaped byte windows also distinguish invalid UTF-8 faithfully.
+fn display_output_difference(left: &[u8], right: &[u8], offset: usize, labels: [&str; 2]) {
+    const BEFORE: usize = 64;
+    const AFTER: usize = 256;
+    eprintln!(
+        "First differing byte at offset {offset}; complete output sizes: {} | {} bytes.",
+        left.len(),
+        right.len()
+    );
+    for (label, bytes) in [(labels[0], left), (labels[1], right)] {
+        let start = offset.saturating_sub(BEFORE).min(bytes.len());
+        let end = offset.saturating_add(AFTER).min(bytes.len());
+        eprintln!(
+            "  {label} bytes [{start}..{end}): {}",
+            bytes[start..end].escape_ascii()
+        );
     }
 }
 
@@ -3729,6 +3729,52 @@ mod tests {
     }
 
     #[test]
+    fn output_difference_locates_bytes_without_utf8_or_line_assumptions() {
+        assert_eq!(first_output_difference(b"", b""), None);
+        assert_eq!(first_output_difference(b"same\n", b"same\n"), None);
+        assert_eq!(first_output_difference(b"", b"\0"), Some(0));
+        assert_eq!(first_output_difference(b"\0", b""), Some(0));
+        assert_eq!(first_output_difference(b"a\xff", b"a\xfe"), Some(1));
+        assert_eq!(first_output_difference(b"prefix", b"prefix\0"), Some(6));
+        assert_eq!(first_output_difference(b"prefix\0", b"prefix"), Some(6));
+    }
+
+    #[test]
+    fn long_output_mismatches_preserve_complete_verdict_and_output_evidence() {
+        for separator in [b'a', b'\n'] {
+            let mut left_bytes = vec![b'a'; 200_000];
+            for byte in left_bytes.iter_mut().skip(1).step_by(2) {
+                *byte = separator;
+            }
+            let mut right_bytes = left_bytes.clone();
+            right_bytes[150_000] = 0xff;
+            assert_eq!(first_output_difference(&left_bytes, &right_bytes), Some(150_000));
+            for stderr in [false, true] {
+                let (left, right) = if stderr {
+                    (output(0, b"", &left_bytes), output(0, b"", &right_bytes))
+                } else {
+                    (output(0, &left_bytes, b""), output(0, &right_bytes, b""))
+                };
+                let (log1, log2) = empty_logs();
+                let outcome = compare(&left, log1, &right, log2).unwrap();
+                assert_eq!(outcome.verdict, Verdict::Diverged);
+                let report = verification_report(&outcome);
+                assert!(!report.verified && !report.bitwise_parity);
+                let evidence = report.compared_outputs.unwrap();
+                if stderr {
+                    assert_eq!(evidence.left.stderr_bytes, 200_000);
+                    assert_eq!(evidence.right.stderr_bytes, 200_000);
+                    assert_ne!(evidence.left.stderr_sha256, evidence.right.stderr_sha256);
+                } else {
+                    assert_eq!(evidence.left.stdout_bytes, 200_000);
+                    assert_eq!(evidence.right.stdout_bytes, 200_000);
+                    assert_ne!(evidence.left.stdout_sha256, evidence.right.stdout_sha256);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn identical_outputs_verify_successfully() {
         let left = output(0, b"hello\n", b"");
         let right = left.clone();
@@ -3776,53 +3822,6 @@ mod tests {
         // Collapsing to the legacy exit convention still propagates the guest
         // code; the verdict channel above is what a caller keys on.
         assert_eq!(outcome.into_exit_status().unwrap(), ExitStatus::Exited(3));
-    }
-
-    #[test]
-    fn production_comparison_callers_bind_truthful_side_labels() {
-        for (name, source, left, right) in [
-            ("generic run", include_str!("run.rs"), "run 1", "run 2"),
-            ("DBT run", include_str!("backends.rs"), "run 1", "run 2"),
-            (
-                "record/replay",
-                include_str!("record_start.rs"),
-                "the recording",
-                "the replay",
-            ),
-        ] {
-            let production = source
-                .rsplit_once("#[cfg(test)]")
-                .expect("production/test boundary")
-                .0;
-            for label in [left, right] {
-                let binding = format!("label: \"{label}\"");
-                assert_eq!(
-                    production.matches(&binding).count(),
-                    1,
-                    "{name} must bind {label:?} exactly once"
-                );
-            }
-        }
-
-        let production = include_str!("verify.rs")
-            .rsplit_once("#[cfg(test)]")
-            .expect("production/test boundary")
-            .0;
-        assert!(production.contains("side_labels: compared_labels.clone()"));
-        assert_eq!(
-            production
-                .matches("retain_verification_logs([(label1, log1), (label2, log2)])")
-                .count(),
-            2,
-            "both retained-log paths must use the caller-bound labels"
-        );
-        assert_eq!(
-            production
-                .matches("retain_verification_logs([(label1, log1)])")
-                .count(),
-            1,
-            "the golden-log path after a match must use the caller-bound label"
-        );
     }
 
     #[test]

@@ -6,6 +6,10 @@ branches from 0.5.0.
 
 ## 0.5.3 (Unreleased)
 
+- Bound captured stdout/stderr mismatch rendering to escaped-byte windows at the
+  first difference, avoiding quadratic allocations for long lines or many
+  lines. Exact byte comparison, complete output evidence and full log
+  verification remain unchanged, including invalid UTF-8 output.
 - Stream complete `BitwiseInfoV1` log comparisons and the success-only
   unsupported-syscall warning scan instead of materializing entire logs and
   normalized record collections. Retain full-tail validation, canonical
