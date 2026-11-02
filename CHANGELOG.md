@@ -6,6 +6,10 @@ branches from 0.5.0.
 
 ## 0.5.3 (Unreleased)
 
+- Check idle-poller freshness and thread lifecycle eligibility before reading
+  live signal dispositions for terminal deadlock detection. Avoid unnecessary
+  whole-queue `/proc` scans during wake/repark bursts; retain every positive
+  verdict's signal checks and preserve guest execution and clock accounting.
 - Index frozen host-input mutation coverage in a borrowed, component-ordered
   flat array. Bulk input-set, directory-digest and replay-finalization queries
   use a binary search instead of scanning every mutation for every path.

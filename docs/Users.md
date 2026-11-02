@@ -214,6 +214,12 @@ connection therefore improves coverage but does not guarantee that every
 PostgreSQL wait can park. Compare polling counts and host-wall intervals
 separately from virtual time; preserve strict repeated-result verification.
 
+Terminal idle-poller checks first reject stale attempts and runnable, retiring
+or doomed threads using scheduler-owned state. Only a remaining candidate
+requires live signal-disposition checks for every relevant task. This avoids
+whole-queue `/proc` observations during wake/repark bursts without caching
+signal state, dropping handler checks or changing guest turns and clocks.
+
 ### Bootstrap initialization and policy epochs
 
 `patches/fullstack-persistent-bootstrap.patch` removes repeated application

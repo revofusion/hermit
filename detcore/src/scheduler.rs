@@ -18392,31 +18392,45 @@ impl Scheduler {
     /// state unless a parked thread is woken first. Whether something can
     /// still wake one is the caller's question (`stuck_with_only_idle_pollers`).
     fn only_idle_guest_pollers_remain(&self) -> bool {
-        // The queued requests first: a runnable thread at the head of the
-        // queue, the usual case, ends the check at once.
-        let pollers_wait = !self.run_queue.is_empty()
-            && self.run_queue.tids().all(|&tid| {
-                self.request_satisfies(tid, |rs| {
-                    self.waits_on_guest_state(rs)
-                        && rs.poll_deadline.is_none()
-                        && !rs.polls_a_named_fifo
-                        && !rs.waits_until_nothing_else_can_run
-                        && !self.poller_may_run_external_handler(tid, rs)
-                })
-            });
+        // Reject from scheduler-owned state before reading live signal state.
+        // In particular, a stale poll must retry regardless of dispositions;
+        // scanning every poller's /proc status first makes wake/repark storms
+        // pay for a whole-queue kernel scan on each unsuccessful check.
+        if self.run_queue.is_empty() {
+            return false;
+        }
+        let pollers_wait = self.run_queue.tids().all(|&tid| {
+            self.request_satisfies(tid, |rs| {
+                self.waits_on_guest_state(rs)
+                    && rs.poll_deadline.is_none()
+                    && !rs.polls_a_named_fifo
+                    && !rs.waits_until_nothing_else_can_run
+            })
+        });
         if !pollers_wait {
             return false;
         }
         let progress = self.latest_progress(None).max(self.retired_at);
-        self.run_queue
+        if !self
+            .run_queue
             .tids()
             .all(|&tid| self.attempted_since(tid, progress))
-            && self.next_turns.keys().all(|&tid| {
-                (self.run_queue.contains_tid(tid)
-                    || self.is_parked(tid) && !self.parked_thread_may_run_external_handler(tid))
+            || !self.next_turns.keys().all(|&tid| {
+                (self.run_queue.contains_tid(tid) || self.is_parked(tid))
                     && !self.thread_is_doomed(tid)
                     && !self.process_is_going_down(tid)
             })
+        {
+            return false;
+        }
+        // The guest is quiesced, so masks and dispositions cannot change
+        // between these passes. A positive verdict still checks every
+        // relevant task live; no signal state survives this observation.
+        self.run_queue.tids().all(|&tid| {
+            self.request_satisfies(tid, |rs| !self.poller_may_run_external_handler(tid, rs))
+        }) && self.next_turns.keys().all(|&tid| {
+            self.run_queue.contains_tid(tid) || !self.parked_thread_may_run_external_handler(tid)
+        })
     }
 
     /// Whether `tid`'s process is going down although no committed turn
