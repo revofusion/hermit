@@ -1327,8 +1327,16 @@ pub fn setup_double_run(
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review re-emitting aggregate warnings captured by verification.
 fn unsupported_syscalls_from_log(path: &Path) -> io::Result<BTreeSet<String>> {
+    use std::io::BufRead;
+
     let mut syscalls = BTreeSet::new();
-    for line in std::fs::read_to_string(path)?.lines() {
+    let mut reader = io::BufReader::new(std::fs::File::open(path)?);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
         let Some((_, remainder)) = line.split_once("syscalls ") else {
             continue;
         };
@@ -3589,6 +3597,33 @@ mod tests {
         assert_eq!(
             unsupported_syscalls_from_log(file.path()).unwrap(),
             BTreeSet::from(["getppid".to_owned(), "vmsplice".to_owned()])
+        );
+    }
+
+    #[test]
+    fn unsupported_warning_scan_validates_the_complete_utf8_tail() {
+        let file = NamedTempFile::new().unwrap();
+        fs::write(
+            file.path(),
+            b"syscalls getppid used but not yet supported\r\n\
+              syscalls vmsplice,getppid,not-a-name used but not yet supported",
+        )
+        .unwrap();
+        assert_eq!(
+            unsupported_syscalls_from_log(file.path()).unwrap(),
+            BTreeSet::from(["getppid".to_owned(), "vmsplice".to_owned()])
+        );
+
+        fs::write(
+            file.path(),
+            b"syscalls getppid used but not yet supported\nunrelated \xff\n",
+        )
+        .unwrap();
+        assert_eq!(
+            unsupported_syscalls_from_log(file.path())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
         );
     }
 

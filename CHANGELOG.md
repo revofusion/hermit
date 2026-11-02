@@ -6,6 +6,11 @@ branches from 0.5.0.
 
 ## 0.5.3 (Unreleased)
 
+- Stream complete `BitwiseInfoV1` log comparisons and the success-only
+  unsupported-syscall warning scan instead of materializing entire logs and
+  normalized record collections. Retain full-tail validation, canonical
+  address identity, truncation refusal, exact counts, divergence coordinates
+  and syscall context. Diagnostic limits do not weaken verification.
 - Give proven Unix stream peers connection-local readiness generations instead
   of waking every unrelated Unix waiter on each read, write or close. Reuse
   existing connection custody, retain shared domain authority, and keep stable

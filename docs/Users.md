@@ -42,6 +42,29 @@ unsolicited file descriptors inherited from its caller. Pass guest inputs throug
 the documented file, mount and standard-stream options. An operating system that
 cannot perform this descriptor cleanup is refused before a guest starts.
 
+## Comparing large verification captures
+
+`hermit log-diff --verify-json verdict.json RUN_A RUN_B` compares retained
+strict verification captures with the fixed `BitwiseInfoV1` policy. The
+canonical log engine streams both complete logs rather than retaining their
+records, normalized copies and syscall histories in memory. Its working set
+depends on the largest record, distinct canonical address identities and the
+requested diagnostic history, not a collection of all records. The
+success-only unsupported-syscall warning scan also uses a reusable line buffer.
+
+All records still receive structural validation, including non-INFO records
+and the tail after the displayed-difference limit. INFO comparison, address
+identity, multiline framing, truncation refusal, exact counts and first
+divergent record/syscall/scheduler coordinates retain their existing semantics.
+A diagnostic limit limits rendering, not the amount verified; `--print-logs`
+prints side-labeled canonical records as they are compared. Captured stdout
+and stderr are still compared byte for byte.
+
+Native validation compared a differing 21-million-INFO-record pair completely
+in 113 seconds with 118 MiB peak RSS; a matching 3,804,781-record pair passed
+with exact stdout/stderr in 19 seconds with 77 MiB peak RSS. These are
+comparison measurements, not guest-execution speedups.
+
 ## Native hybrid CPUs and non-root identity
 
 Intel Raptor Lake family 6, model `0xb7` is admitted only when the tracing

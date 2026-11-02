@@ -27,6 +27,8 @@ use tempfile::NamedTempFile;
 use crate::detlog::DetLogEvent;
 use crate::detlog::DetLogRecord;
 
+mod streaming;
+
 /// The in-band line a bounded log writer emits when a run's log file reaches
 /// its configured size bound.
 ///
@@ -277,21 +279,19 @@ impl LogDiffOpts {
         false
     }
 
+    fn includes_deterministic(&self, message: &LogMessage<'_>) -> bool {
+        (is_detlog(message)
+            && !self.skip_detlog(message)
+            && !is_scheduler_committed_time(message))
+            || (is_commit(message)
+                && !self.skip_commit
+                && !is_internal_io_poll_commit(message))
+    }
+
     fn filter_deterministic<'a>(&self, v: &[LogMessage<'a>]) -> Vec<LogMessage<'a>> {
         v.iter()
-            .filter_map(|message| {
-                if (is_detlog(message)
-                    && !self.skip_detlog(message)
-                    && !is_scheduler_committed_time(message))
-                    || (is_commit(message)
-                        && !self.skip_commit
-                        && !is_internal_io_poll_commit(message))
-                {
-                    Some(*message)
-                } else {
-                    None
-                }
-            })
+            .filter(|message| self.includes_deterministic(message))
+            .copied()
             .collect()
     }
 }
@@ -489,26 +489,48 @@ fn canonicalize_addresses_in_line(
     map: &mut HashMap<String, usize>,
     next: &mut usize,
 ) -> String {
-    // Match ONLY the explicit host-address marker emitted by `host_addr`; the
-    // captured group is the raw `0x...` value used as the ordinal key.
+    let mut output = String::new();
+    if !canonicalize_addresses_into(line, map, next, &mut output) {
+        output.push_str(line);
+    }
+    output
+}
+
+/// Reuse the caller's buffer. A record without address markers stays borrowed.
+fn canonicalize_addresses_into(
+    line: &str,
+    map: &mut HashMap<String, usize>,
+    next: &mut usize,
+    output: &mut String,
+) -> bool {
+    use std::fmt::Write as _;
+
     static RE_HOSTADDR: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"<hostaddr (0[xX][A-Fa-f0-9]+)>").unwrap());
-
-    RE_HOSTADDR
-        .replace_all(line, |caps: &regex::Captures| {
-            let addr = &caps[1];
-            let ord = match map.get(addr) {
-                Some(existing) => *existing,
-                None => {
-                    let assigned = *next;
-                    *next += 1;
-                    map.insert(addr.to_string(), assigned);
-                    assigned
-                }
-            };
-            format!("<addr{ord}>")
-        })
-        .into_owned()
+    output.clear();
+    let mut previous = 0;
+    let mut changed = false;
+    for captures in RE_HOSTADDR.captures_iter(line) {
+        let matched = captures.get(0).expect("whole address marker");
+        output.push_str(&line[previous..matched.start()]);
+        let address = &captures[1];
+        let ordinal = match map.get(address) {
+            Some(existing) => *existing,
+            None => {
+                let assigned = *next;
+                *next += 1;
+                map.insert(address.to_owned(), assigned);
+                assigned
+            }
+        };
+        write!(output, "<addr{ordinal}>").expect("writing to String");
+        previous = matched.end();
+        changed = true;
+    }
+    if changed {
+        output.push_str(&line[previous..]);
+    }
+    changed
 }
 
 fn messages_for_comparison(
@@ -707,36 +729,39 @@ struct LogMessage<'a> {
     event: Option<DetLogEvent>,
 }
 
+fn parse_log_message(index: usize, record: &str) -> std::io::Result<LogMessage<'_>> {
+    if !["ERROR ", "WARN ", "INFO ", "DEBUG ", "TRACE "]
+        .iter()
+        .any(|tag| record.starts_with(tag))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "log line {index} has no ERROR/WARN/INFO/DEBUG/TRACE tag, so it cannot be \
+                 placed in the compared record stream: {record}"
+            ),
+        ));
+    }
+    let (text, structured) = DetLogRecord::split(record).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("log record {index} has an invalid structured DETLOG result: {error}"),
+        )
+    })?;
+    Ok(LogMessage {
+        index,
+        text,
+        event: structured.map(|record| record.event),
+    })
+}
+
 fn extract_log_messages(contents: &str) -> std::io::Result<Vec<LogMessage<'_>>> {
-    let ts = &*RECORD_START;
-    let tag = Regex::new("^(ERROR|WARN|INFO|DEBUG|TRACE) ").unwrap();
-    ts.split(contents) // Not aware of a streaming version of this RE split operation.
+    RECORD_START
+        .split(contents)
         .enumerate()
-        .map(|(i, s)| (i, s.trim()))
-        .filter(|(_, s)| !s.is_empty())
-        .map(|(i, s)| {
-            // Only let through lines that start with one of the expected tags:
-            if !tag.is_match(s) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "log line {i} has no ERROR/WARN/INFO/DEBUG/TRACE tag, so it cannot be \
-                         placed in the compared record stream: {s}"
-                    ),
-                ));
-            }
-            let (text, record) = DetLogRecord::split(s).map_err(|error| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("log record {i} has an invalid structured DETLOG result: {error}"),
-                )
-            })?;
-            Ok(LogMessage {
-                index: i,
-                text,
-                event: record.map(|record| record.event),
-            })
-        })
+        .map(|(index, record)| (index, record.trim()))
+        .filter(|(_, record)| !record.is_empty())
+        .map(|(index, record)| parse_log_message(index, record))
         .collect()
 }
 
@@ -1691,9 +1716,13 @@ pub fn try_compare_bitwise_info_v1_with_records(
     file_b: &Path,
     side_labels: ComparisonSideLabels,
 ) -> std::io::Result<(LogDiffSummary, usize, usize)> {
-    let bytes_a = std::fs::read(file_a)?;
-    let bytes_b = std::fs::read(file_b)?;
-    try_compare_bitwise_info_v1_bytes_with_records(&bytes_a, &bytes_b, side_labels)
+    streaming::compare_files(
+        file_a,
+        file_b,
+        side_labels,
+        BitwiseInfoV1Diagnostics::default(),
+        &mut std::io::stderr(),
+    )
 }
 
 /// Canonical comparison over bytes already captured by the caller.
@@ -1724,7 +1753,7 @@ pub struct BitwiseInfoV1Diagnostics {
     pub syscall_history: u64,
     /// Disable terminal color in rendered differences.
     pub no_color: bool,
-    /// Print both selected canonical streams before reporting differences.
+    /// Print side-labeled canonical records as they are compared.
     pub print_logs: bool,
 }
 
@@ -1747,15 +1776,7 @@ pub fn try_compare_bitwise_info_v1_with_records_and_diagnostics(
     diagnostics: BitwiseInfoV1Diagnostics,
     writer: &mut impl Write,
 ) -> std::io::Result<(LogDiffSummary, usize, usize)> {
-    let bytes_a = std::fs::read(file_a)?;
-    let bytes_b = std::fs::read(file_b)?;
-    try_compare_bitwise_info_v1_bytes_with_records_and_diagnostics(
-        &bytes_a,
-        &bytes_b,
-        side_labels,
-        diagnostics,
-        writer,
-    )
+    streaming::compare_files(file_a, file_b, side_labels, diagnostics, writer)
 }
 
 /// Canonical file comparison with caller-selected diagnostic output.
@@ -1796,15 +1817,7 @@ pub fn try_compare_bitwise_info_v1_bytes_with_records_and_diagnostics(
             format!("{} is not UTF-8: {error}", side_labels.right),
         )
     })?;
-    let mut options = bitwise_info_v1_options(side_labels);
-    options.limit = diagnostics.difference_limit;
-    options.syscall_history = diagnostics.syscall_history;
-    options.no_color = diagnostics.no_color;
-    options.print_logs = diagnostics.print_logs;
-    let records_a = record_count(str_a);
-    let records_b = record_count(str_b);
-    let summary = log_diff_summary_from_strs_with_filter(str_a, str_b, &options, writer, |_| true)?;
-    Ok((summary, records_a, records_b))
+    streaming::compare_strs(str_a, str_b, side_labels, diagnostics, writer)
 }
 
 /// Construct the complete fixed policy used by `BitwiseInfoV1` callers.
@@ -1857,7 +1870,7 @@ pub fn try_log_diff_detailed_with_filter(
 /// Total records in a log, including a final record that may still be being
 /// written. Use [`complete_record_count`] when the log is still growing.
 pub fn record_count(contents: &str) -> usize {
-    record_starts(contents).len()
+    RECORD_START.find_iter(contents).count()
 }
 
 /// Like [`try_log_diff_detailed`], but also reports how many records each log
