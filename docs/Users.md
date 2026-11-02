@@ -135,6 +135,84 @@ This does not qualify AMD/KVM: the separate pv1 KVM regression attempt still
 failed at `perf_event_open` with permission denied, even with timeslices
 disabled. No additional pv1 host perf-policy change was made.
 
+## PostgreSQL readiness in multi-service workloads
+
+For scheduler-owned PostgreSQL socket waits, connect every client through the
+server's Unix socket directory inside Hermit's private `/tmp`. Active native TCP
+still falls back to polling: traced endpoints alone do not prove that every
+queued packet or kernel timer is a scheduler-owned producer.
+
+The lab harness cutover is recorded in `patches/fullstack-postgres-unix.patch`.
+It changes the existing `fullstack-fix` configuration for SSP, routefinder and
+all operators' primary and ephemeral databases to URLs such as:
+
+```text
+postgresql://dst@/sparkcore?host=/tmp/hermit-fullstack/pg/sock&port=25732
+```
+
+Apply it once from the directory containing the matching `fullstack-fix` harness
+with `patch -p1 < /path/to/hermit/patches/fullstack-postgres-unix.patch`.
+This is a transport change, not a reduction of leaves, signing, SQL operations,
+durability settings or readiness deadlines. Native driver probes confirmed
+Unix-socket selection for routefinder and operators; the installed SSP
+SQLAlchemy/asyncpg dialect accepted the directory and port.
+
+Producer-local UDP error queues/broadcast options, TCP receive-queue annotation,
+and scalar Unix datagrams do not revoke unrelated owned Unix streams. Proven
+read-only minimal route dumps also preserve authority. Passing physically
+verified ordinary log-file descriptors over a guest-held Unix stream socketpair
+does not export a socket capability; the affected descriptors still follow
+their existing per-file and flock custody accounting.
+
+Proven Unix stream pairs have a shared connection-local mutation generation.
+A read, write, shutdown or close wakes that connection's observers rather than
+every unrelated Unix stream. The scheduler owns the mapping by stable
+open-file-description identity; aliases and native lifecycle notifications
+retain it after descriptor-number reuse or peer-handle destruction.
+
+Domain authority remains a separate dependency: revocation still wakes all
+affected connections. Listeners and unpaired endpoints retain conservative
+mutation dependencies. A connection is promoted only when the existing
+connect/accept custody model proves its peer; ambiguous order, failed dequeue,
+dead pending peers, counter exhaustion or post-accept metadata errors prevent
+promotion. RPC revision 24 distinguishes this dependency protocol from older
+recordings and binaries.
+
+UDP and Unix datagram descriptors remain unowned. Datagram message APIs,
+transferred sockets, unknown options, mutating route requests, external
+producers and unsupported epoll sources retain fallback. In particular, a
+scalar datagram read can discard a queued descriptor and deliver stream EOF;
+authority is already revoked before the preceding ancillary send. A Unix
+connection therefore improves coverage but does not guarantee that every
+PostgreSQL wait can park. Compare polling counts and host-wall intervals
+separately from virtual time; preserve strict repeated-result verification.
+
+### Bootstrap initialization and policy epochs
+
+`patches/fullstack-persistent-bootstrap.patch` removes repeated application
+imports from the matching lab harness. Apply it from the directory containing
+`fullstack-fix` with
+`patch -p1 < /path/to/hermit/patches/fullstack-persistent-bootstrap.patch`.
+
+The controller starts one SSP application process inside Hermit. Existing
+bootstrap commands become clients of a private, mode-0600 Unix socket.
+Commands are serialized and retain their original application contexts,
+database commits and session teardown. Balances and readiness are still queried
+from the real services; no query results are cached. The controller retains its
+service-health checks, per-command deadlines and error handling, including the
+initial import in the first command's deadline. Application diagnostics remain
+in `ssp_bootstrap.log`; command results and failures retain individual logs.
+
+Use a fixed epoch compatible with the application's dated policies, not merely
+one that makes repeated traces match. The evaluated Spark snapshot rejects
+tree-node IDs predating 2026-03-17 when selecting liquidity, although its raw
+available-leaf count includes those nodes. An epoch of 2026-01-01 can therefore
+produce 1,024 available leaves but no selectable payment liquidity.
+The lab's corrected epoch is `2026-11-01T00:00:00Z`; generated certificate
+validity must also agree with it. Keep that epoch identical across repeats.
+Neither a leaf count nor a bootstrap-only repeat qualifies settlement: require
+the original bidirectional payment assertions as well.
+
 ## Scheduler-owned file locks
 
 `hermit run --event-driven-io` supports blocking `flock` on native ptrace for

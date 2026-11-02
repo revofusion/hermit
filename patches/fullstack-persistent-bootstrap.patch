@@ -1,0 +1,223 @@
+--- a/fullstack-fix/ordinary_ssp.py
++++ b/fullstack-fix/ordinary_ssp.py
+@@ -1,7 +1,8 @@
+ """Ordinary real-service bootstrap and external-LND payment, never a lane driver.
+ 
+-Run each subcommand as a separate process with QUART_ENV=development,
+-QUART_CONFIG=/tmp/hermit-fullstack/ssp_config.py and the real source PYTHONPATH.
++The traced controller starts one application process; subcommands use a private
++Unix socket. Each command retains its own application context and DB session.
++QUART_ENV=development and QUART_CONFIG select the real service configuration.
+ Only LND and block-mining transports use local RPC endpoints instead of minikube.
+ No app managers, task execution, entropy, time, status, or DB event implementations
+ are replaced. Schema requires the genuine migration revision-chain artifact.
+@@ -17,6 +18,8 @@
+ from uuid import UUID
+ import sys
+ import time
++import socket
++import traceback
+ 
+ 
+ def progress(stage, **fields):
+@@ -86,44 +89,50 @@
+         send_status = sent.status.name
+         state = helpers.external_lnd_invoice_state(external_hash)
+         assert state == 'SETTLED', state
+-        print(json.dumps({'receive_status': receive_status,
+-                          'receive_preimage_hash_matches': True,
+-                          'external_lnd_payment': 'SUCCEEDED',
+-                          'send_status': send_status,
+-                          'external_lnd_invoice': state}))
+-
+-
+-async def main(args):
++        return {'receive_status': receive_status,
++                'receive_preimage_hash_matches': True,
++                'external_lnd_payment': 'SUCCEEDED',
++                'send_status': send_status,
++                'external_lnd_invoice': state}
++
++
++def load_app():
+     forbidden = [k for k in os.environ if k.startswith(('SPARKDST_', 'SPARKNODE_LANE_', 'SSP_DST_'))]
+     if forbidden:
+         raise RuntimeError('Remove lane instrumentation environment: ' + ','.join(forbidden))
+-    progress('ssp_import_starting', command=args.command)
++    progress('ssp_import_starting', command='serve')
+     from sparkcore.core.app import create_app
+     from sparklib.core.database import db, do_initdb
+     from sparklib.ent.framework.viewer_context_factory import ViewerContextFactory
+-    progress('ssp_import_finished', command=args.command)
++    progress('ssp_import_finished', command='serve')
+     app = create_app()
+-    progress('ssp_app_created', command=args.command)
++    progress('ssp_app_created', command='serve')
+     if app.testing or not app.config['SPARKNODE_CONTAINER_REST_URLS'] or not app.config['ROUTEFINDER_BASE_URL']:
+         raise RuntimeError('Real node and routefinder configuration with TESTING=False required')
+     if not app.config['CELERY']['broker_url'].startswith('amqp://'):
+         raise RuntimeError('Real RabbitMQ required')
++    return app
++
++
++async def execute(args, app):
++    from sparklib.core.database import db, do_initdb
++    from sparklib.ent.framework.viewer_context_factory import ViewerContextFactory
++
+     if args.command == 'schema':
+         chain = Path('/webdev/sparkcore/alembic/revision_chain.json')
+         if not chain.is_file():
+             raise RuntimeError('Missing genuine revision_chain.json matching bundled source; do not bypass Alembic stamp')
+         progress('ssp_do_initdb_starting')
+-        print(json.dumps({'schema_created': await do_initdb(app, 'alembic')}))
++        initialized = await do_initdb(app, 'alembic')
+         progress('ssp_do_initdb_finished')
+-        return
++        return {'schema_created': initialized}
+     if args.command == 'payment':
+-        await payment(app, args.sdk_config)
+-        return
++        return await payment(app, args.sdk_config)
+     async with app.app_context():
+         if args.command == 'identity':
+             from coincurve import PrivateKey
+             key = PrivateKey(bytes.fromhex(app.config['SPARK_REGTEST_IDENTITY_PRIVATE_KEY']))
+-            print(json.dumps({'ssp_identity_public_key': key.public_key.format(compressed=True).hex()}))
++            return {'ssp_identity_public_key': key.public_key.format(compressed=True).hex()}
+         elif args.command == 'node':
+             from sparkcore.spark.signing_operator import gen_create_spark_operators_from_config
+             from sparkcore.spark.testing.ssp_initialize import gen_initialize_ssp
+@@ -131,7 +140,7 @@
+             await db.session.commit()
+             await gen_initialize_ssp()
+             await db.session.commit()
+-            print(json.dumps({'node_id': app.config['SPARK_LIGHTNING_NODES']['regtest']}))
++            return {'node_id': app.config['SPARK_LIGHTNING_NODES']['regtest']}
+         elif args.command in ('funding-address', 'funding-balance'):
+             from sparkcore.ent.repo.lightning_node.node_with_server_signing_repo import NodeWithServerSigningRepo
+             from sparkcore.ent.schema.l1.l1_wallet_address_purpose import L1WalletAddressPurpose
+@@ -152,20 +161,19 @@
+                 # this is the same production aggregate query, never a cached balance.
+                 await db.session.remove()
+                 if args.deadline is None or owned_sats >= args.minimum_sats:
+-                    print(json.dumps({'owned_sats': owned_sats}))
+-                    return
++                    return {'owned_sats': owned_sats}
+                 remaining = args.deadline - time.monotonic()
+                 if remaining <= 0:
+                     raise RuntimeError('Readiness timed out: SSP L1 funding observation')
+                 await asyncio.sleep(min(1, remaining))
+             address = await wallet.gen_new_address(vc, L1WalletAddressPurpose.DEPOSIT)
+             await db.session.commit()
+-            print(json.dumps({'address': address.bitcoin_address}))
++            return {'address': address.bitcoin_address}
+         elif args.command == 'watch-chain':
+             from sparkcore.l1.chain_watcher import watch_regtest_chain
+             await watch_regtest_chain.gen_delay()
+             await db.session.commit()
+-            print(json.dumps({'watch_regtest_chain_enqueued': True}))
++            return {'watch_regtest_chain_enqueued': True}
+         elif args.command == 'trees':
+             from sparkcore.spark.testing import ssp_create_trees
+             from sparkcore.services.services import service_provider
+@@ -182,10 +190,10 @@
+             await ssp_create_trees.gen_create_trees()
+             await db.session.commit()
+             count = await ssp_create_trees._gen_tree_node_count()
+-            print(json.dumps({'available_ssp_leaves': count}))
+-
+-
+-if __name__ == '__main__':
++            return {'available_ssp_leaves': count}
++
++
++def parse_command(argv):
+     parser = argparse.ArgumentParser()
+     parser.add_argument('command', choices=['schema', 'identity', 'node', 'funding-address',
+                                            'funding-balance', 'watch-chain', 'trees', 'payment'])
+@@ -193,4 +201,57 @@
+     parser.add_argument('--mining-address')
+     parser.add_argument('--minimum-sats', type=int, default=0)
+     parser.add_argument('--deadline', type=float)
+-    asyncio.run(main(parser.parse_args()))
++    return parser.parse_args(argv)
++
++
++SOCKET_PATH = '/tmp/hermit-fullstack/ssp-bootstrap.sock'
++
++
++async def serve():
++    # Commands are serialized; the application behaves like a normal persistent
++    # service, while execute() keeps the original per-command DB context.
++    command_lock = asyncio.Lock()
++
++    async def handle(reader, writer):
++        try:
++            args = parse_command(json.loads(await reader.readline()))
++            async with command_lock:
++                result = await execute(args, app)
++            response = {'returncode': 0, 'result': result}
++        except Exception:
++            response = {'returncode': 1, 'error': traceback.format_exc()}
++        try:
++            writer.write(json.dumps(response).encode() + b'\n')
++            await writer.drain()
++        finally:
++            writer.close()
++            await writer.wait_closed()
++
++    # Bind before importing so the existing controller deadline also covers
++    # application initialization. Requests cannot execute until load_app returns.
++    server = await asyncio.start_unix_server(handle, path=SOCKET_PATH)
++    os.chmod(SOCKET_PATH, 0o600)
++    app = load_app()
++    async with server:
++        await server.serve_forever()
++
++
++def client(argv):
++    parse_command(argv)
++    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stream:
++        stream.connect(SOCKET_PATH)
++        stream.sendall(json.dumps(argv).encode() + b'\n')
++        with stream.makefile('rb') as response_stream:
++            response = json.load(response_stream)
++    if response['returncode']:
++        print(response['error'], file=sys.stderr, end='')
++    else:
++        print(json.dumps(response['result']))
++    return response['returncode']
++
++
++if __name__ == '__main__':
++    if sys.argv[1:] == ['serve']:
++        asyncio.run(serve())
++    else:
++        raise SystemExit(client(sys.argv[1:]))
+--- a/fullstack-fix/run.py
++++ b/fullstack-fix/run.py
+@@ -35,6 +35,7 @@
+ control = None
+ serial = 0
+ shutting_down = False
++bootstrap_proc = None
+ btc_args = [BTC+'bitcoin-cli', '-regtest', '-datadir='+str(ROOT/'bitcoin'), '-rpcport=8632',
+             '-rpcuser=testutil', '-rpcpassword=testutilpassword']
+ ln_args = [LND+'lncli', '--network=regtest', '--lnddir='+str(ROOT/'lnd'), '--rpcserver=127.0.0.1:10009']
+@@ -183,7 +184,15 @@
+                 '-p','25732','-U','dst','-d',db,'-c',query]).stdout.strip()
+ 
+ def bootstrap(command, *args, check=True, timeout=600):
+-    return run(['/bin/sh',ROOT/'services.sh','bootstrap',command,*args],check=check,timeout=timeout)
++    global bootstrap_proc
++    started = time.monotonic()
++    if bootstrap_proc is None:
++        bootstrap_proc = spawn('ssp_bootstrap', ['/bin/sh', ROOT/'services.sh', 'bootstrap', 'serve'])
++        wait_for('SSP bootstrap socket', lambda: (ROOT/'ssp-bootstrap.sock').is_socket(), seconds=timeout)
++    remaining = timeout - (time.monotonic() - started)
++    if remaining <= 0:
++        raise RuntimeError('SSP bootstrap initialization exceeded command deadline')
++    return run(['/bin/sh',ROOT/'services.sh','bootstrap',command,*args],check=check,timeout=remaining)
+ 
+ def mine(count, address):
+     hashes=btc('generatetoaddress',str(count),address)

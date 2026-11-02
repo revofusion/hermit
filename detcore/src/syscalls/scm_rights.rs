@@ -1045,6 +1045,9 @@ struct PendingConnections {
     /// too many connections waited: which connection an `accept` takes is
     /// unknown until a guest binds the name again.
     unknown: bool,
+    /// Readiness requires stricter queue provenance than best-effort SCM joins:
+    /// a failed accept may have dequeued a connection without returning an fd.
+    readiness_unknown: bool,
 }
 
 impl PendingConnections {
@@ -1089,7 +1092,12 @@ impl UnixConnections {
     /// A guest bound `listener` to `name`: its listener's queue starts
     /// empty. Which bind of the name it was, for the listener to keep.
     pub(crate) fn bound(&mut self, name: &[u8], listener: OpenFileHandle) -> u64 {
-        self.binds += 1;
+        let Some(next) = self.binds.checked_add(1) else {
+            self.lost();
+            self.names.clear();
+            return self.binds;
+        };
+        self.binds = next;
         self.names.insert(
             name.into(),
             PendingConnections {
@@ -1161,6 +1169,22 @@ impl UnixConnections {
         }
         pending.sockets.pop_front()
     }
+
+    fn readiness_peer(&mut self, name: &[u8], generation: u64, in_turn: bool) -> bool {
+        let Some(pending) = self.names.get_mut(name) else { return false; };
+        if pending.generation != generation || !in_turn || pending.unknown
+            || pending.sockets.front().is_none_or(|peer| peer.readiness_unix_stream_id().is_none())
+        {
+            pending.readiness_unknown = true;
+        }
+        !pending.readiness_unknown
+    }
+
+    fn lose_readiness(&mut self) {
+        for pending in self.names.values_mut() {
+            pending.readiness_unknown = true;
+        }
+    }
 }
 
 /// Whether guests alone hold both ends of a connection that a `connect` or
@@ -1191,6 +1215,12 @@ fn with_connections<T: RecordOrReplay, G: Guest<Detcore<T>>, R>(
     f(&mut connections)
 }
 
+/// Invoked in the physical attempt before another connection can be associated.
+/// Preserve the older SCM queue policy; only withdraw the stronger readiness
+/// certificate when an error may have enqueued/dequeued a native connection.
+pub(crate) fn uncertain_readiness_connection<G: Guest<Detcore<T>>, T: RecordOrReplay>(guest: &G) {
+    with_connections(guest, UnixConnections::lose_readiness);
+}
 impl ReceiveGeometry {
     /// The geometry of `call`, a `recvmsg` or `recvmmsg`, read from guest
     /// memory before it runs; `None` for any other call or an unreadable
@@ -3275,18 +3305,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         listener: RawFd,
         fd: RawFd,
         in_turn: bool,
-    ) -> Option<OpenFileHandle> {
+    ) -> (Option<OpenFileHandle>, bool) {
         if !self.pairs_unix_sockets(guest) {
-            return None;
+            return (None, false);
         }
         let Ok(Some((name, generation, kind))) = guest
             .thread_state()
             .with_detfd(listener, |detfd| detfd.unix_name_and_type())
         else {
-            return None;
+            return (None, false);
         };
-        let peer = with_connections(guest, |connections| {
-            connections.accepted(&name, generation, in_turn)
+        let event_driven = guest.config().event_driven_io;
+        let (peer, readiness) = with_connections(guest, |connections| {
+            let readiness = event_driven && kind == libc::SOCK_STREAM
+                && connections.readiness_peer(&name, generation, in_turn);
+            (connections.accepted(&name, generation, in_turn), readiness)
         });
         let _ = guest.thread_state().with_detfd(fd, |detfd| {
             detfd.set_unix_type(kind);
@@ -3294,7 +3327,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 detfd.pair_with(peer, kind == libc::SOCK_STREAM);
             }
         });
-        peer
+        (peer, readiness)
     }
 
     /// What descriptor `fd` of the calling thread links to, or `None` where
@@ -3782,6 +3815,36 @@ mod tests {
         assert_eq!(name_of(libc::AF_UNIX, b"relative", offset + 8), None);
         assert_eq!(name_of(libc::AF_UNIX, b"", offset), None);
         assert_eq!(name_of(libc::AF_INET, b"\0abc", offset + 4), None);
+    }
+
+    #[test]
+    fn readiness_accept_certificate_is_stricter_without_changing_scm_queue_consumption() {
+        let mut connections = UnixConnections::default();
+        let name = b"\0readiness-certificate";
+        let socket = crate::fd::DetFd::new(3, nix::fcntl::OFlag::O_RDWR,
+            crate::fd::FdType::Socket,
+            crate::types::OpenFileId::new(crate::types::DetTid::from_raw(1), 1));
+        socket.set_unix_type(libc::SOCK_STREAM);
+        socket.set_socket_domain(crate::event_driven_io::SocketDomain::Unix, false);
+        let bind = connections.bound(name, socket.open_file_handle());
+        connections.connected(name, Some(socket.open_file_handle()));
+        assert!(connections.readiness_peer(name, bind, true));
+        connections.lose_readiness();
+        assert!(!connections.readiness_peer(name, bind, true));
+        assert!(connections.accepted(name, bind, true).is_some());
+        let bind = connections.bound(name, socket.open_file_handle());
+        connections.connected(name, Some(OpenFileHandle::dangling()));
+        connections.connected(name, Some(socket.open_file_handle()));
+        assert!(!connections.readiness_peer(name, bind, true));
+        assert!(connections.accepted(name, bind, true).is_some());
+        assert!(!connections.readiness_peer(name, bind, true));
+        // A wrapped bind generation must never authenticate an older listener.
+        connections.binds = u64::MAX;
+        let exhausted = connections.bound(name, socket.open_file_handle());
+        connections.connected(name, Some(socket.open_file_handle()));
+        assert_eq!(exhausted, u64::MAX);
+        assert!(!connections.readiness_peer(name, exhausted, true));
+        assert!(connections.accepted(name, exhausted, true).is_none());
     }
 
     /// Connections to a bound name are taken by its accepts in order; a

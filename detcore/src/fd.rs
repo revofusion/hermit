@@ -272,6 +272,15 @@ impl OpenFileHandle {
         self.with_description(|d| d.guest_created).unwrap_or(false)
     }
 
+    /// Stable identity of a live traced Unix stream, never a descriptor slot.
+    pub(crate) fn readiness_unix_stream_id(&self) -> Option<OpenFileId> {
+        self.with_description(|d| {
+            (d.socket_domain == Some(crate::event_driven_io::SocketDomain::Unix)
+                && d.rights.unix_type == Some(libc::SOCK_STREAM))
+                .then_some(d.id)
+        }).flatten()
+    }
+
     /// Runs `f` on the description's model, as [`DetFd::with_description`]
     /// does, if any modeled descriptor still refers to it.
     fn with_description<R>(&self, f: impl FnOnce(&mut OpenFileDescription) -> R) -> Option<R> {

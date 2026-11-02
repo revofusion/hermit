@@ -22,6 +22,7 @@ const MAX_TOTAL_IOVECS: usize = 256;
 const NLMSG_HEADER: usize = 16;
 const RTM_GETLINK: u16 = 18;
 const RTM_GETADDR: u16 = 22;
+const RTM_GETROUTE: u16 = 26;
 const NLM_F_REQUEST: u16 = 1;
 const NLM_F_ACK: u16 = 4;
 const NLM_F_DUMP: u16 = 0x300;
@@ -234,10 +235,10 @@ fn message(
     dump_datagram(&payload[..length])
 }
 
-/// Only unfiltered GETLINK/GETADDR dumps, with no attributes or modifiers.
-/// glibc uses a four-byte padded rtgenmsg (20 bytes with nlmsghdr), not always
-/// the larger ifinfomsg/ifaddrmsg. A one-byte rtgenmsg plus wire alignment is
-/// equivalent; all unused body and alignment bytes must be zero.
+/// Only unfiltered GETLINK/GETADDR dumps and the minimal GETROUTE dump.
+/// glibc pads rtgenmsg to four bytes; Go sends its single byte without tail
+/// padding. Padding is needed between messages, not after an exact final
+/// message. Supplied padding and unused body bytes must still be zero.
 fn dump_datagram(bytes: &[u8]) -> bool {
     if bytes.is_empty() || bytes.len() > MAX_DATAGRAM {
         return false;
@@ -269,10 +270,14 @@ fn dump_datagram(bytes: &[u8]) -> bool {
                 matches!(body.len(), 1 | 4 | 8)
                     && matches!(family, libc::AF_UNSPEC | libc::AF_INET | libc::AF_INET6)
             }
+            RTM_GETROUTE => body.len() == 1 && family == libc::AF_UNSPEC,
             _ => false,
         };
         if !body_valid || body[1..].iter().any(|byte| *byte != 0) {
             return false;
+        }
+        if length == message.len() {
+            return true;
         }
         let Some(aligned) = length.checked_add(3).map(|length| length & !3) else {
             return false;
@@ -335,6 +340,39 @@ mod tests {
                 bytes[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_DUMP | NLM_F_ACK).to_ne_bytes());
                 assert!(dump_datagram(&bytes));
             }
+        }
+    }
+
+    #[test]
+    fn terminal_unpadded_route_dump_and_mixed_mutations() {
+        let mut route = request(RTM_GETROUTE, libc::AF_UNSPEC, 1);
+        assert!(dump_datagram(&route));
+        route.truncate(NLMSG_HEADER + 1);
+        assert!(dump_datagram(&route));
+        for suffix in [1, 2] {
+            let mut partial_padding = route.clone();
+            partial_padding.resize(route.len() + suffix, 0);
+            assert!(!dump_datagram(&partial_padding));
+        }
+        let mut batch = request(RTM_GETLINK, libc::AF_UNSPEC, 4);
+        batch.extend(&route);
+        assert!(dump_datagram(&batch));
+        for kind in [24, 25, u16::MAX] {
+            let mut mutation = route.clone();
+            mutation[4..6].copy_from_slice(&kind.to_ne_bytes());
+            assert!(!dump_datagram(&mutation));
+            let mut mixed = request(RTM_GETROUTE, libc::AF_UNSPEC, 1);
+            mixed.extend(mutation);
+            assert!(!dump_datagram(&mixed));
+        }
+        // A second header cannot start at an unaligned offset.
+        route.extend(request(RTM_GETLINK, libc::AF_UNSPEC, 4));
+        assert!(!dump_datagram(&route));
+        for family in [libc::AF_UNIX, libc::AF_INET, libc::AF_INET6] {
+            assert!(!dump_datagram(&request(RTM_GETROUTE, family, 1)));
+        }
+        for body in [4, 12, 16] {
+            assert!(!dump_datagram(&request(RTM_GETROUTE, libc::AF_UNSPEC, body)));
         }
     }
 

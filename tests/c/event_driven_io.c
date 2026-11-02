@@ -9,6 +9,8 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
 #include <net/if.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -1112,6 +1114,195 @@ static void signalfd_epoll_child(int fresh) {
              : "signalfd: inherited epoll keeps parent wake queue; child record stays private");
 }
 
+/* Exact Go syscall.NetlinkRIB(RTM_GETROUTE, AF_UNSPEC) wire shape:
+ * nlmsg_len=17, REQUEST|DUMP, seq=1, pid=0, one-byte rtgenmsg, no tail pad.
+ * The negative request is too short for rtmsg, so cannot change a route even
+ * when the test runs with CAP_NET_ADMIN. It must still revoke authority. */
+static void socket_route_prelude(int mutation) {
+  int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+  CHECK(fd >= 0);
+  struct sockaddr_nl kernel = {.nl_family = AF_NETLINK};
+  CHECK(bind(fd, (struct sockaddr *)&kernel, sizeof(kernel)) == 0);
+  struct nlmsghdr header = {
+      .nlmsg_len = NLMSG_LENGTH(1),
+      .nlmsg_type = mutation ? RTM_NEWROUTE : RTM_GETROUTE,
+      .nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP,
+      .nlmsg_seq = 1,
+  };
+  unsigned char request[NLMSG_LENGTH(1)] = {0};
+  memcpy(request, &header, sizeof(header));
+  CHECK(sendto(fd, request, sizeof(request), 0,
+               (struct sockaddr *)&kernel, sizeof(kernel)) == sizeof(request));
+  int done = 0, routes = 0;
+  while (!done) {
+    union {
+      struct nlmsghdr alignment;
+      unsigned char bytes[32768];
+    } reply;
+    struct sockaddr_nl sender = {0};
+    socklen_t sender_length = sizeof(sender);
+    ssize_t received = recvfrom(fd, reply.bytes, sizeof(reply.bytes), 0,
+                                (struct sockaddr *)&sender, &sender_length);
+    CHECK(received > 0 && sender_length == sizeof(sender));
+    CHECK(sender.nl_family == AF_NETLINK && sender.nl_pid == 0);
+    int remaining = (int)received;
+    for (struct nlmsghdr *item = (struct nlmsghdr *)reply.bytes;
+         NLMSG_OK(item, remaining); item = NLMSG_NEXT(item, remaining)) {
+      CHECK(item->nlmsg_seq == 1);
+      CHECK(!(item->nlmsg_flags & NLM_F_DUMP_INTR));
+      if (item->nlmsg_type == NLMSG_ERROR) {
+        CHECK(mutation && item->nlmsg_len >= NLMSG_LENGTH(sizeof(struct nlmsgerr)));
+        struct nlmsgerr error;
+        memcpy(&error, NLMSG_DATA(item), sizeof(error));
+        CHECK(error.error < 0);
+        done = 1;
+      } else if (item->nlmsg_type == NLMSG_DONE) {
+        CHECK(!mutation && item->nlmsg_len >= NLMSG_LENGTH(sizeof(int)));
+        int error;
+        memcpy(&error, NLMSG_DATA(item), sizeof(error));
+        CHECK(error == 0);
+        done = 1;
+      } else {
+        CHECK(!mutation && item->nlmsg_type == RTM_NEWROUTE);
+        CHECK(item->nlmsg_len >= NLMSG_LENGTH(sizeof(struct rtmsg)));
+        ++routes;
+      }
+    }
+    CHECK(remaining == 0);
+  }
+  CHECK(mutation || routes > 0);
+  CHECK(close(fd) == 0);
+}
+
+static void socket_rights_prelude(int socket_right) {
+  int transport[2], input[2], output[2], sockets[2];
+  CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, transport) == 0);
+  make_pipe(input);
+  make_pipe(output);
+  char path[] = "/tmp/event-driven-rights-XXXXXX";
+  int log = mkstemp(path);
+  CHECK(log >= 0);
+  int saved_stderr = dup(STDERR_FILENO);
+  CHECK(saved_stderr >= 0 && dup2(log, STDERR_FILENO) == STDERR_FILENO);
+  int alias = dup(STDERR_FILENO);
+  CHECK(alias >= 0 && dup2(saved_stderr, STDERR_FILENO) == STDERR_FILENO);
+  CHECK(close(saved_stderr) == 0);
+  if (socket_right)
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+  int sent[] = {input[0], output[1], socket_right ? sockets[0] : alias};
+  char marker = 'f';
+  struct iovec iov = {.iov_base = &marker, .iov_len = 1};
+  union {
+    struct cmsghdr alignment;
+    char bytes[CMSG_SPACE(sizeof(sent))];
+  } ancillary = {0};
+  struct msghdr message = {
+      .msg_iov = &iov, .msg_iovlen = 1,
+      .msg_control = ancillary.bytes, .msg_controllen = sizeof(ancillary.bytes),
+  };
+  struct cmsghdr *control = CMSG_FIRSTHDR(&message);
+  control->cmsg_level = SOL_SOCKET;
+  control->cmsg_type = SCM_RIGHTS;
+  control->cmsg_len = CMSG_LEN(sizeof(sent));
+  memcpy(CMSG_DATA(control), sent, sizeof(sent));
+  CHECK(sendmsg(transport[0], &message, 0) == 1);
+  memset(&ancillary, 0, sizeof(ancillary));
+  marker = 0;
+  CHECK(recvmsg(transport[1], &message, 0) == 1 && marker == 'f');
+  CHECK(!(message.msg_flags & MSG_CTRUNC));
+  control = CMSG_FIRSTHDR(&message);
+  CHECK(control && control->cmsg_level == SOL_SOCKET
+        && control->cmsg_type == SCM_RIGHTS
+        && control->cmsg_len == CMSG_LEN(sizeof(sent)));
+  int received[3];
+  memcpy(received, CMSG_DATA(control), sizeof(received));
+  put_byte(input[1], 'i');
+  get_byte(received[0], 'i');
+  put_byte(received[1], 'o');
+  get_byte(output[0], 'o');
+  put_byte(received[2], 'l');
+  if (socket_right) {
+    get_byte(sockets[1], 'l');
+    CHECK(close(sockets[0]) == 0 && close(sockets[1]) == 0);
+  } else {
+    CHECK(lseek(log, 0, SEEK_SET) == 0);
+    get_byte(log, 'l');
+  }
+  for (size_t i = 0; i < 3; ++i)
+    CHECK(close(received[i]) == 0);
+  CHECK(close(alias) == 0 && close(log) == 0 && unlink(path) == 0);
+  CHECK(close(input[0]) == 0 && close(input[1]) == 0);
+  CHECK(close(output[0]) == 0 && close(output[1]) == 0);
+  CHECK(close(transport[0]) == 0 && close(transport[1]) == 0);
+}
+
+static void socket_unix_datagram_prelude(int message_receive) {
+  int receiver = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  int sender = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  CHECK(receiver >= 0 && sender >= 0);
+  char directory[] = "/tmp/event-driven-datagram-XXXXXX";
+  CHECK(mkdtemp(directory) == directory);
+  struct sockaddr_un address = {.sun_family = AF_UNIX};
+  CHECK(snprintf(address.sun_path, sizeof(address.sun_path), "%s/socket",
+                 directory) > 0);
+  CHECK(bind(receiver, (struct sockaddr *)&address, sizeof(address)) == 0);
+  CHECK(connect(sender, (struct sockaddr *)&address, sizeof(address)) == 0);
+  if (message_receive) {
+    int pipe_fds[2];
+    if (message_receive == 2)
+      CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, pipe_fds) == 0);
+    else
+      make_pipe(pipe_fds);
+    char byte = 'd';
+    struct iovec iov = {.iov_base = &byte, .iov_len = 1};
+    union {
+      struct cmsghdr alignment;
+      char bytes[CMSG_SPACE(sizeof(int))];
+    } ancillary = {0};
+    struct msghdr message = {
+        .msg_iov = &iov, .msg_iovlen = 1,
+        .msg_control = ancillary.bytes, .msg_controllen = sizeof(ancillary.bytes),
+    };
+    struct cmsghdr *control = CMSG_FIRSTHDR(&message);
+    control->cmsg_level = SOL_SOCKET;
+    control->cmsg_type = SCM_RIGHTS;
+    control->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(control), &pipe_fds[0], sizeof(int));
+    CHECK(sendmsg(sender, &message, 0) == 1);
+    if (message_receive == 2) {
+      /* The queued right is now the last reference to the stream endpoint.
+       * A scalar datagram read discards it and delivers peer EOF. Authority
+       * must already have been revoked by the preceding SCM_RIGHTS send. */
+      CHECK(close(pipe_fds[0]) == 0);
+      get_byte(receiver, 'd');
+      expect_eof(pipe_fds[1]);
+      CHECK(close(pipe_fds[1]) == 0);
+      CHECK(close(sender) == 0 && close(receiver) == 0);
+      CHECK(unlink(address.sun_path) == 0 && rmdir(directory) == 0);
+      return;
+    }
+    memset(&ancillary, 0, sizeof(ancillary));
+    byte = 0;
+    CHECK(recvmsg(receiver, &message, 0) == 1 && byte == 'd');
+    CHECK(!(message.msg_flags & MSG_CTRUNC));
+    control = CMSG_FIRSTHDR(&message);
+    CHECK(control && control->cmsg_level == SOL_SOCKET
+          && control->cmsg_type == SCM_RIGHTS
+          && control->cmsg_len == CMSG_LEN(sizeof(int)));
+    int received;
+    memcpy(&received, CMSG_DATA(control), sizeof(received));
+    put_byte(pipe_fds[1], 'a');
+    get_byte(received, 'a');
+    CHECK(close(received) == 0);
+    CHECK(close(pipe_fds[0]) == 0 && close(pipe_fds[1]) == 0);
+  } else {
+    put_byte(sender, 'd');
+    get_byte(receiver, 'd');
+  }
+  CHECK(close(sender) == 0 && close(receiver) == 0);
+  CHECK(unlink(address.sun_path) == 0 && rmdir(directory) == 0);
+}
+
 /* These real, unrelated producers precede the owned Unix wait. None may
  * permanently disable its idle parking, data wakeup, or EOF wakeup. */
 static void socket_unrelated_prelude(void) {
@@ -1165,6 +1356,17 @@ static void socket_unrelated_prelude(void) {
   int receiver = socket(AF_INET, SOCK_DGRAM, 0);
   int sender = socket(AF_INET, SOCK_DGRAM, 0);
   CHECK(receiver >= 0 && sender >= 0);
+  int enabled = 1;
+  CHECK(setsockopt(sender, SOL_SOCKET, SO_BROADCAST, &enabled, sizeof(enabled)) == 0);
+  CHECK(setsockopt(sender, IPPROTO_IP, IP_RECVERR, &enabled, sizeof(enabled)) == 0);
+  CHECK(setsockopt(receiver, IPPROTO_IP, IP_RECVERR, &enabled, sizeof(enabled)) == 0);
+  int ipv6 = socket(AF_INET6, SOCK_DGRAM, 0);
+  CHECK(ipv6 >= 0);
+  CHECK(setsockopt(ipv6, IPPROTO_IPV6, IPV6_RECVERR, &enabled, sizeof(enabled)) == 0);
+  enabled = 0;
+  CHECK(setsockopt(sender, SOL_SOCKET, SO_BROADCAST, &enabled, sizeof(enabled)) == 0);
+  CHECK(setsockopt(ipv6, IPPROTO_IPV6, IPV6_RECVERR, &enabled, sizeof(enabled)) == 0);
+  CHECK(close(ipv6) == 0);
   struct sockaddr_in address = {
       .sin_family = AF_INET,
       .sin_port = 0,
@@ -1259,7 +1461,7 @@ static int tcp_listener(int unrelated) {
     const int options[][2] = {
         {TCP_MAXSEG, 1460}, {TCP_USER_TIMEOUT, 1000}, {TCP_SYNCNT, 3},
         {TCP_LINGER2, 60}, {TCP_WINDOW_CLAMP, 65535}, {TCP_QUICKACK, 1},
-        {TCP_DEFER_ACCEPT, 1},
+        {TCP_DEFER_ACCEPT, 1}, {TCP_INQ, 1},
     };
     for (size_t i = 0; i < sizeof(options) / sizeof(options[0]); ++i) {
       CHECK(setsockopt(fd, IPPROTO_TCP, options[i][0],
@@ -1375,6 +1577,99 @@ static void socket_listener(int tcp, int abstract, int unrelated) {
   }
   puts(tcp ? "socket: TCP producer wakes passive listener after idle"
            : "socket: Unix data and EOF wake with passive TCP listener");
+}
+
+/* Independent pathname connections, not socketpairs: one busy stream must not
+ * repeatedly reschedule all the idle epoll consumers. Children acknowledge
+ * half-close before exiting, so SIGCHLD cannot repair a missing EOF wake. */
+static void socket_connection_groups(int failed_accept) {
+  enum { COUNT = 32, ROUNDS = 16 };
+  char directory[] = "/tmp/hermit-connection-groups-XXXXXX";
+  CHECK(mkdtemp(directory) != NULL);
+  struct sockaddr_un address = {.sun_family = AF_UNIX};
+  CHECK(snprintf(address.sun_path, sizeof(address.sun_path), "%s/socket", directory) > 0);
+  int listener = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
+  CHECK(listener >= 0);
+  CHECK(bind(listener, (struct sockaddr *)&address, sizeof(address)) == 0);
+  CHECK(listen(listener, COUNT) == 0);
+  CHECK(accept(listener, NULL, NULL) == -1 && errno == EAGAIN);
+  int clients[COUNT], servers[COUNT], ready[2], release[2];
+  pid_t children[COUNT];
+  make_pipe(ready);
+  make_pipe(release);
+  for (int i = 0; i < COUNT; ++i) {
+    clients[i] = socket(AF_UNIX, SOCK_STREAM, 0);
+    CHECK(clients[i] >= 0);
+    CHECK(connect(clients[i], (struct sockaddr *)&address, sizeof(address)) == 0);
+  }
+  if (failed_accept) {
+    /* Linux can dequeue before rejecting an unreadable output length. */
+    CHECK(syscall(SYS_accept4, listener, &address, (void *)1, 0) == -1 && errno == EFAULT);
+    CHECK(close(clients[0]) == 0);
+    clients[0] = socket(AF_UNIX, SOCK_STREAM, 0);
+    CHECK(clients[0] >= 0);
+    CHECK(connect(clients[0], (struct sockaddr *)&address, sizeof(address)) == 0);
+  }
+  for (int i = 0; i < COUNT; ++i) {
+    int index = failed_accept ? (i + 1) % COUNT : i;
+    servers[index] = accept(listener, NULL, NULL);
+    CHECK(servers[index] >= 0);
+  }
+  for (int i = 0; i < COUNT; ++i) {
+    children[i] = fork();
+    CHECK(children[i] >= 0);
+    if (children[i] == 0) {
+      CHECK(close(listener) == 0);
+      CHECK(close(ready[0]) == 0);
+      CHECK(close(release[1]) == 0);
+      for (int j = 0; j < COUNT; ++j) {
+        CHECK(close(clients[j]) == 0);
+        if (j != i)
+          CHECK(close(servers[j]) == 0);
+      }
+      int connection = dup(servers[i]);
+      CHECK(connection >= 0 && close(servers[i]) == 0);
+      int epoll = epoll_create1(EPOLL_CLOEXEC);
+      CHECK(epoll >= 0);
+      struct epoll_event interest = {.events = EPOLLIN | EPOLLRDHUP | EPOLLET};
+      CHECK(epoll_ctl(epoll, EPOLL_CTL_ADD, connection, &interest) == 0);
+      put_byte(ready[1], 'r');
+      for (int round = 0; round < (i == 0 ? ROUNDS : 0); ++round) {
+        struct epoll_event event;
+        CHECK(epoll_wait(epoll, &event, 1, -1) == 1);
+        get_byte(connection, 'd');
+        put_byte(connection, 'a');
+      }
+      struct epoll_event event;
+      CHECK(epoll_wait(epoll, &event, 1, -1) == 1);
+      expect_eof(connection);
+      put_byte(connection, 'e');
+      get_byte(release[0], 'q');
+      _exit(0);
+    }
+  }
+  CHECK(close(ready[1]) == 0 && close(release[0]) == 0);
+  for (int i = 0; i < COUNT; ++i) {
+    CHECK(close(servers[i]) == 0);
+    get_byte(ready[0], 'r');
+  }
+  for (int round = 0; round < ROUNDS; ++round) {
+    wait_for_consumer();
+    put_byte(clients[0], 'd');
+    get_byte(clients[0], 'a');
+  }
+  for (int i = 0; i < COUNT; ++i) {
+    CHECK(shutdown(clients[i], SHUT_WR) == 0);
+    get_byte(clients[i], 'e');
+  }
+  for (int i = 0; i < COUNT; ++i)
+    put_byte(release[1], 'q');
+  for (int i = 0; i < COUNT; ++i) {
+    joined(children[i]);
+    CHECK(close(clients[i]) == 0);
+  }
+  CHECK(close(listener) == 0 && close(ready[0]) == 0 && close(release[1]) == 0);
+  CHECK(unlink(address.sun_path) == 0 && rmdir(directory) == 0);
 }
 
 static void socketpair_alias(void) {
@@ -1494,8 +1789,41 @@ int main(int argc, char** argv) {
     socket_listener(1, 0, 0);
   } else if (strcmp(argv[1], "socketpair-alias") == 0) {
     socketpair_alias();
+  } else if (strcmp(argv[1], "socket-connection-groups") == 0) {
+    socket_connection_groups(0);
+  } else if (strcmp(argv[1], "socket-accept-error-groups") == 0) {
+    socket_connection_groups(1);
   } else if (strcmp(argv[1], "socket-unrelated-producers") == 0) {
     socket_unrelated_prelude();
+    socket_route_prelude(0);
+    socket_rights_prelude(0);
+    socket_unix_datagram_prelude(0);
+    socket_listener(0, 0, 1);
+  } else if (strcmp(argv[1], "socket-udp-unknown-option") == 0) {
+    int udp = socket(AF_INET, SOCK_DGRAM, 0);
+    CHECK(udp >= 0);
+    int enabled = 1;
+    errno = 0;
+    CHECK(setsockopt(udp, IPPROTO_IP, -1, &enabled, sizeof(enabled)) == -1);
+    CHECK(errno == ENOPROTOOPT);
+    CHECK(close(udp) == 0);
+    /* Even a rejected unknown option remains fail-closed. Real Unix
+     * accept/data/EOF must still work via polling after revocation. */
+    socket_listener(0, 0, 1);
+  } else if (strcmp(argv[1], "socket-route-mutation-fallback") == 0) {
+    socket_route_prelude(1);
+    socket_listener(0, 0, 1);
+  } else if (strcmp(argv[1], "socket-rights-regular") == 0) {
+    socket_rights_prelude(0);
+    socket_listener(0, 0, 0);
+  } else if (strcmp(argv[1], "socket-rights-socket-fallback") == 0) {
+    socket_rights_prelude(1);
+    socket_listener(0, 0, 1);
+  } else if (strcmp(argv[1], "socket-datagram-message-fallback") == 0) {
+    socket_unix_datagram_prelude(1);
+    socket_listener(0, 0, 1);
+  } else if (strcmp(argv[1], "socket-datagram-discard-fallback") == 0) {
+    socket_unix_datagram_prelude(2);
     socket_listener(0, 0, 1);
   } else {
     CHECK(!"unknown scenario");

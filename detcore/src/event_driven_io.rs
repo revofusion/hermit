@@ -55,6 +55,8 @@ pub enum Key {
     /// Internal dependency, never a descriptor supplied by the guest.
     Signal(QueueId, u8),
     SocketDomain(SocketDomain),
+    SocketAuthority(SocketDomain),
+    SocketConnection(OpenFileId),
     /// Stable per-file dependency; unlike File, shared by independent opens.
     Flock(OpenFileId),
 }
@@ -74,7 +76,8 @@ pub struct Snapshot(pub Vec<(Key, u64)>, pub(crate) Option<Observer>);
 pub enum Update {
     Create(Key, bool),
     Socket { key: Key, domain: SocketDomain },
-    SocketChange(SocketDomain),
+    PairUnixStreams { first: OpenFileId, second: OpenFileId },
+    SocketChange(OpenFileId),
     RevokeSocketDomain(SocketDomain),
     SuspendSocketProbe(SocketProbe),
     SettleSocketProbe { probe: SocketProbe, no_effect: bool },
@@ -114,6 +117,7 @@ struct Source {
     interests: Option<BTreeMap<(i32, Option<OpenFileId>), Interest>>,
     signalfd_mask: Option<u64>,
     socket_domain: Option<SocketDomain>,
+    socket_connection: Option<OpenFileId>,
     pending_socket_probe: Option<SocketProbe>,
     last_socket_probe: u64,
     subscribers: BTreeSet<DetTid>,
@@ -170,7 +174,10 @@ impl Dependencies {
         }
         found.insert(key, source.generation);
         if let Some(domain) = source.socket_domain {
-            self.collect(Key::SocketDomain(domain), observer, compatible, visited, found)?;
+            self.collect(Key::SocketAuthority(domain), observer, compatible, visited, found)?;
+            let mutation = source.socket_connection.map_or(
+                Key::SocketDomain(domain), Key::SocketConnection);
+            self.collect(mutation, observer, compatible, visited, found)?;
         }
         if let Some(mask) = source.signalfd_mask {
             let observer = observer.ok_or(Unavailable::Unknown(key))?;
@@ -326,7 +333,7 @@ impl Dependencies {
                     source.last_socket_probe = probe.attempt;
                     true
                 });
-                let domain = Key::SocketDomain(SocketDomain::Unix);
+                let domain = Key::SocketAuthority(SocketDomain::Unix);
                 let source = self.sources.entry(domain).or_default();
                 let conflict = source.pending_socket_probe.is_some() || !trusted;
                 if !conflict {
@@ -335,7 +342,7 @@ impl Dependencies {
                 return self.change([domain], conflict);
             }
             Update::SettleSocketProbe { probe, no_effect } => {
-                let domain = Key::SocketDomain(SocketDomain::Unix);
+                let domain = Key::SocketAuthority(SocketDomain::Unix);
                 let source = self.sources.entry(domain).or_default();
                 let matches = source.pending_socket_probe == Some(probe);
                 if matches {
@@ -350,6 +357,7 @@ impl Dependencies {
                     // Keep the tombstone even when the first unsafe producer
                     // precedes the first eligible socket.
                     self.sources.entry(Key::SocketDomain(domain)).or_default();
+                    self.sources.entry(Key::SocketAuthority(domain)).or_default();
                     self.sources.entry(key).or_insert_with(|| Source {
                         socket_domain: Some(domain),
                         ..Source::default()
@@ -357,12 +365,33 @@ impl Dependencies {
                 }
                 return BTreeSet::new();
             }
-            Update::SocketChange(domain) => {
-                return self.change([Key::SocketDomain(domain)], false);
+            Update::PairUnixStreams { first, second } => {
+                let group = first.min(second);
+                let valid = first != second && !self.disabled && [first, second].iter().all(|id| {
+                    self.sources.get(&Key::File(*id)).is_some_and(|source| {
+                        source.socket_domain == Some(SocketDomain::Unix) && !source.revoked
+                            && source.socket_connection.is_none_or(|old| old == group)
+                    })
+                });
+                let existing = [first, second].map(|id| {
+                    self.sources.get(&Key::File(id)).and_then(|source| source.socket_connection)
+                });
+                let valid = valid && (existing == [None, None] || existing == [Some(group), Some(group)]);
+                if !valid {
+                    return self.update(Update::RevokeSocketDomain(SocketDomain::Unix));
+                }
+                // Invalidate observations made before promotion. Group identity
+                // lives in the scheduler's OFD tombstones, not a weak peer handle.
+                let wake = self.change([Key::File(first), Key::File(second)], false);
+                self.sources.entry(Key::SocketConnection(group)).or_default();
+                for id in [first, second] {
+                    self.sources.get_mut(&Key::File(id)).unwrap().socket_connection = Some(group);
+                }
+                return wake;
             }
             Update::RevokeSocketDomain(domain) => {
-                self.sources.entry(Key::SocketDomain(domain)).or_default();
-                return self.change([Key::SocketDomain(domain)], true);
+                self.sources.entry(Key::SocketAuthority(domain)).or_default();
+                return self.change([Key::SocketAuthority(domain)], true);
             }
             Update::Create(key, epoll) => {
                 if self.disabled {
@@ -408,11 +437,13 @@ impl Dependencies {
                     false,
                 );
             }
+            Update::SocketChange(id) => return self.change([Key::File(id)], false),
             Update::Change(keys) => (keys, false),
             Update::Revoke(keys) => (keys, true),
             Update::RevokeAll => {
                 for domain in [SocketDomain::Unix, SocketDomain::TcpNoIngress] {
                     self.sources.entry(Key::SocketDomain(domain)).or_default();
+                    self.sources.entry(Key::SocketAuthority(domain)).or_default();
                 }
                 (self.sources.keys().copied().collect(), true)
             }
@@ -462,35 +493,23 @@ impl Dependencies {
         let mut wake = BTreeSet::new();
         let mut domains = [false; 2];
         for key in keys {
-            if let Some(source) = self.sources.get_mut(&key) {
-                if let Some(domain) = source.socket_domain {
-                    domains[domain as usize] = true;
-                }
-                // Exhaustion revokes rather than allowing an ABA generation.
-                match source.generation.checked_add(1) {
-                    Some(next) => source.generation = next,
-                    None => source.revoked = true,
-                }
-                if revoke && !source.revoked {
-                    self.counters.revoked_sources += 1;
-                }
-                source.revoked |= revoke;
-                wake.extend(source.subscribers.iter().copied());
+            let mutation = self.sources.get(&key).and_then(|source| {
+                source.socket_domain.map(|domain| {
+                    if revoke {
+                        domains[domain as usize] = true;
+                    }
+                    source.socket_connection.map_or(
+                        Key::SocketDomain(domain), Key::SocketConnection)
+                })
+            });
+            self.change_source(key, revoke, &mut wake);
+            if let Some(mutation) = mutation {
+                self.change_source(mutation, revoke, &mut wake);
             }
         }
-        // Domain subscribers are shared: no scan of unrelated socket OFDs.
         for domain in [SocketDomain::Unix, SocketDomain::TcpNoIngress] {
-            if !domains[domain as usize] {
-                continue;
-            }
-            let domain = Key::SocketDomain(domain);
-            if let Some(source) = self.sources.get_mut(&domain) {
-                match source.generation.checked_add(1) {
-                    Some(next) => source.generation = next,
-                    None => source.revoked = true,
-                }
-                source.revoked |= revoke;
-                wake.extend(source.subscribers.iter().copied());
+            if domains[domain as usize] {
+                self.change_source(Key::SocketAuthority(domain), true, &mut wake);
             }
         }
         for tid in &wake {
@@ -498,6 +517,21 @@ impl Dependencies {
         }
         self.counters.mutation_wakes += wake.len() as u64;
         wake
+    }
+
+    fn change_source(&mut self, key: Key, revoke: bool, wake: &mut BTreeSet<DetTid>) {
+        if let Some(source) = self.sources.get_mut(&key) {
+            // Exhaustion revokes rather than allowing an ABA generation.
+            match source.generation.checked_add(1) {
+                Some(next) => source.generation = next,
+                None => source.revoked = true,
+            }
+            if revoke && !source.revoked {
+                self.counters.revoked_sources += 1;
+            }
+            source.revoked |= revoke;
+            wake.extend(source.subscribers.iter().copied());
+        }
     }
 
     /// Revoke queued dependencies before a producer/consumer escapes scheduler
@@ -638,6 +672,12 @@ pub(crate) fn socket_domain<G: Guest<Detcore<T>>, T: RecordOrReplay>(
     guest.thread_state().with_detfd(fd, |file| file.socket_domain()).ok().flatten()
 }
 
+fn socket_id<G: Guest<Detcore<T>>, T: RecordOrReplay>(guest: &G, fd: i32) -> Option<OpenFileId> {
+    guest.thread_state().with_detfd(fd, |file| {
+        file.socket_domain().map(|_| file.open_file_id())
+    }).ok().flatten()
+}
+
 /// Only a traced creation (or accept of a traced listener) calls this.
 pub(crate) async fn socket_created<G: Guest<Detcore<T>>, T: RecordOrReplay>(
     guest: &mut G,
@@ -672,6 +712,19 @@ pub(crate) fn created_udp_socket(family: i32, kind: i32, protocol: i32) -> bool 
         && matches!(protocol, 0 | libc::IPPROTO_UDP)
 }
 
+fn created_unix_datagram(family: i32, kind: i32, protocol: i32) -> bool {
+    family == libc::AF_UNIX && protocol == 0
+        && kind & !(libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK) == libc::SOCK_DGRAM
+}
+
+fn scalar_unix_datagram_operation(number: reverie::syscalls::Sysno) -> bool {
+    use reverie::syscalls::Sysno;
+    matches!(number, Sysno::bind | Sysno::connect | Sysno::shutdown
+        | Sysno::read | Sysno::readv | Sysno::recvfrom
+        | Sysno::write | Sysno::writev | Sysno::sendto)
+}
+
+
 fn local_socket_option(level: i32, option: i32, inet: bool, tcp: bool) -> bool {
     (level == libc::SOL_SOCKET
         && matches!(option, libc::SO_REUSEADDR | libc::SO_REUSEPORT
@@ -684,7 +737,7 @@ fn local_socket_option(level: i32, option: i32, inet: bool, tcp: bool) -> bool {
                 | libc::TCP_KEEPIDLE | libc::TCP_KEEPINTVL | libc::TCP_KEEPCNT
                 | libc::TCP_MAXSEG | libc::TCP_USER_TIMEOUT | libc::TCP_SYNCNT
                 | libc::TCP_LINGER2 | libc::TCP_WINDOW_CLAMP | libc::TCP_QUICKACK
-                | libc::TCP_DEFER_ACCEPT))
+                | libc::TCP_DEFER_ACCEPT | libc::TCP_INQ))
         || (inet && level == libc::IPPROTO_IP
             && matches!(option, libc::IP_TOS | libc::IP_TTL | libc::IP_RECVTOS | libc::IP_RECVTTL))
         || (inet && level == libc::IPPROTO_IPV6
@@ -692,7 +745,19 @@ fn local_socket_option(level: i32, option: i32, inet: bool, tcp: bool) -> bool {
                 | libc::IPV6_UNICAST_HOPS))
 }
 
-fn ordinary_sendfile_endpoint(file: &crate::fd::DetFd) -> bool {
+fn local_udp_socket_option(level: i32, option: i32) -> bool {
+    // UDP error delivery and broadcast permission cannot deliver stream bytes,
+    // pass descriptors, or attach a producer to an owned stream. UDP itself
+    // remains unowned and never subscribes, including broadcast/error replies.
+    // Keep this exception out of TCP: queued packets/timers still require
+    // revocation before active TCP traffic.
+    local_socket_option(level, option, true, false)
+        || (level == libc::SOL_SOCKET && option == libc::SO_BROADCAST)
+        || (level == libc::IPPROTO_IP && option == libc::IP_RECVERR)
+        || (level == libc::IPPROTO_IPV6 && option == libc::IPV6_RECVERR)
+}
+
+pub(crate) fn ordinary_regular_file(file: &crate::fd::DetFd) -> bool {
     matches!(file.ty(), FdType::Regular | FdType::Memfd)
         && file.procfs_position().is_none()
         && file.stat().is_some_and(|stat| stat.mode & libc::S_IFMT == libc::S_IFREG)
@@ -779,6 +844,7 @@ pub(crate) async fn before_socket_attempt<G: Guest<Detcore<T>>, T: RecordOrRepla
     if let Syscall::Socket(create) = call {
         if created_socket_domain(create.family(), create.r#type(), create.protocol()).is_none()
             && !created_udp_socket(create.family(), create.r#type(), create.protocol())
+            && !created_unix_datagram(create.family(), create.r#type(), create.protocol())
             && !crate::socket_query::route_creation(create.family(), create.r#type(), create.protocol())
         {
             revoke_socket_domains(guest, "unsupported socket producer").await;
@@ -796,7 +862,7 @@ pub(crate) async fn before_socket_attempt<G: Guest<Detcore<T>>, T: RecordOrRepla
         // regular-file copy cannot produce socket readiness; a generic Regular
         // label without physical S_IFREG provenance is not enough.
         let ordinary = [args.arg0 as i32, args.arg1 as i32].into_iter().all(|fd| {
-            guest.thread_state().with_detfd(fd, |file| ordinary_sendfile_endpoint(file)).unwrap_or(false)
+            guest.thread_state().with_detfd(fd, |file| ordinary_regular_file(file)).unwrap_or(false)
         });
         if !ordinary {
             revoke_socket_domains(guest, "unproven zero-copy endpoints").await;
@@ -818,10 +884,22 @@ pub(crate) async fn before_socket_attempt<G: Guest<Detcore<T>>, T: RecordOrRepla
                 // UDP stays unowned. Its datagrams cannot deliver bytes or
                 // SCM_RIGHTS to streams; ancillary/background guards still run.
                 if number == Sysno::setsockopt
-                    && !local_socket_option(args.arg1 as i32, args.arg2 as i32, true, false)
+                    && !local_udp_socket_option(args.arg1 as i32, args.arg2 as i32)
                 {
                     revoke_socket_domains(guest, "unsupported UDP socket option").await;
                 }
+                return None;
+            }
+            // Scalar Unix datagrams cannot import descriptors or deliver bytes
+            // to streams. Discarding queued rights CAN close a stream: every
+            // datagram sendmsg/sendmmsg remains fail-closed below, so authority
+            // is lost before such rights enter a queue. An external holder of
+            // an owned stream likewise requires a prior custody escape.
+            // Message receives remain fail-closed before any ancillary import.
+            let unix_datagram = guest.thread_state().with_detfd(fd, |file| {
+                file.unix_type() == Some(libc::SOCK_DGRAM)
+            }).unwrap_or(false);
+            if unix_datagram && scalar_unix_datagram_operation(number) {
                 return None;
             }
         }
@@ -900,9 +978,22 @@ pub(crate) async fn after_socket_attempt<G: Guest<Detcore<T>>, T: RecordOrReplay
     }
     let (_, args) = call.into_parts();
     let mutated = !matches!(result, Err(reverie::Error::Errno(reverie::Errno::EAGAIN)));
+    let connect_no_effect = matches!(result, Err(reverie::Error::Errno(
+        reverie::Errno::ENOENT | reverie::Errno::ENOTDIR
+        | reverie::Errno::ENOTSOCK | reverie::Errno::ECONNREFUSED
+    )));
+    if result.is_err() && mutated
+        && (matches!(call.number(), reverie::syscalls::Sysno::accept | reverie::syscalls::Sysno::accept4)
+            || (call.number() == reverie::syscalls::Sysno::connect && !connect_no_effect))
+        && socket_domain(guest, args.arg0 as i32) == Some(SocketDomain::Unix)
+    {
+        // Even an output-copy fault may follow a dequeue. Do not shift a
+        // guessed FIFO peer into a later successful accept's readiness group.
+        crate::syscalls::scm_rights::uncertain_readiness_connection(guest);
+    }
     if kind == Some(SocketAttemptKind::Mutation) && mutated {
-        if let Some(domain) = socket_domain(guest, args.arg0 as i32) {
-            crate::tool_global::event_driven_io(guest, Update::SocketChange(domain)).await;
+        if let Some(id) = socket_id(guest, args.arg0 as i32) {
+            crate::tool_global::event_driven_io(guest, Update::SocketChange(id)).await;
         }
     }
     // Descriptor metadata still names the old OFD here, before outer handlers
@@ -913,26 +1004,17 @@ pub(crate) async fn after_socket_attempt<G: Guest<Detcore<T>>, T: RecordOrReplay
         _ => None,
     };
     if let Some(fd) = replaced {
-        if let Some(domain) = socket_domain(guest, fd) {
-            crate::tool_global::event_driven_io(guest, Update::SocketChange(domain)).await;
+        if let Some(id) = socket_id(guest, fd) {
+            crate::tool_global::event_driven_io(guest, Update::SocketChange(id)).await;
         }
     }
     if kind == Some(SocketAttemptKind::CloseRange) && result.is_ok() {
-        let mut unix = false;
-        let mut tcp = false;
-        for fd in guest.thread_state().open_fds() {
-            if (args.arg0 as u32..=args.arg1 as u32).contains(&(fd as u32)) {
-                match socket_domain(guest, fd) {
-                    Some(SocketDomain::Unix) => unix = true,
-                    Some(SocketDomain::TcpNoIngress) => tcp = true,
-                    None => {}
-                }
-            }
-        }
-        for (domain, changed) in [(SocketDomain::Unix, unix), (SocketDomain::TcpNoIngress, tcp)] {
-            if changed {
-                crate::tool_global::event_driven_io(guest, Update::SocketChange(domain)).await;
-            }
+        let keys: Vec<_> = guest.thread_state().open_fds().into_iter()
+            .filter(|fd| (args.arg0 as u32..=args.arg1 as u32).contains(&(*fd as u32)))
+            .filter_map(|fd| socket_id(guest, fd).map(Key::File))
+            .collect();
+        if !keys.is_empty() {
+            crate::tool_global::event_driven_io(guest, Update::Change(keys)).await;
         }
     }
 }
@@ -1129,6 +1211,24 @@ pub(crate) async fn after_epoll_progress<G: Guest<Detcore<T>>, T: RecordOrReplay
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unix_datagrams_never_admit_message_or_unknown_capabilities() {
+        use reverie::syscalls::Sysno;
+        assert!(created_unix_datagram(libc::AF_UNIX,
+            libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0));
+        assert!(!created_unix_datagram(libc::AF_INET, libc::SOCK_DGRAM, 0));
+        assert!(!created_unix_datagram(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0));
+        assert!(!created_unix_datagram(libc::AF_UNIX, libc::SOCK_DGRAM, 1));
+        for call in [Sysno::sendmsg, Sysno::sendmmsg, Sysno::recvmsg, Sysno::recvmmsg,
+            Sysno::setsockopt, Sysno::sendfile, Sysno::ioctl] {
+            assert!(!scalar_unix_datagram_operation(call));
+        }
+        let file = crate::fd::DetFd::new(7, nix::fcntl::OFlag::empty(), FdType::Socket,
+            OpenFileId::new(DetTid::from_raw(1), 1));
+        file.set_unix_type(libc::SOCK_DGRAM);
+        assert!(!file.is_udp_socket());
+        assert!(descriptor_key(&file).is_none());
+    }
     fn key() -> Key {
         Key::File(OpenFileId::new(DetTid::from_raw(1), 1))
     }
@@ -1162,7 +1262,8 @@ mod tests {
         assert!(local_socket_option(libc::IPPROTO_IP, libc::IP_TOS, true, true));
         assert!(local_socket_option(libc::SOL_SOCKET, libc::SO_PRIORITY, true, true));
         for option in [libc::TCP_MAXSEG, libc::TCP_USER_TIMEOUT, libc::TCP_SYNCNT,
-            libc::TCP_LINGER2, libc::TCP_WINDOW_CLAMP, libc::TCP_QUICKACK, libc::TCP_DEFER_ACCEPT] {
+            libc::TCP_LINGER2, libc::TCP_WINDOW_CLAMP, libc::TCP_QUICKACK,
+            libc::TCP_DEFER_ACCEPT, libc::TCP_INQ] {
             assert!(local_socket_option(libc::IPPROTO_TCP, option, true, true));
             assert!(!local_socket_option(libc::IPPROTO_TCP, option, true, false));
         }
@@ -1171,6 +1272,42 @@ mod tests {
         assert!(!local_socket_option(libc::SOL_SOCKET, libc::SO_ATTACH_FILTER, true, true));
         assert!(!local_socket_option(libc::SOL_SOCKET, libc::SO_BINDTODEVICE, true, false));
         assert!(!local_socket_option(libc::IPPROTO_TCP, libc::TCP_REPAIR, true, true));
+    }
+
+    #[test]
+    fn udp_error_queues_do_not_extend_stream_authority() {
+        for (level, option) in [
+            (libc::SOL_SOCKET, libc::SO_BROADCAST),
+            (libc::IPPROTO_IP, libc::IP_RECVERR),
+            (libc::IPPROTO_IPV6, libc::IPV6_RECVERR),
+        ] {
+            assert!(local_udp_socket_option(level, option));
+            assert!(!local_socket_option(level, option, true, true));
+            assert!(!local_socket_option(level, option, false, false));
+        }
+        assert!(!local_udp_socket_option(libc::SOL_SOCKET, libc::SO_ATTACH_FILTER));
+        assert!(!local_udp_socket_option(libc::SOL_SOCKET, libc::SO_BINDTODEVICE));
+        assert!(!local_udp_socket_option(libc::IPPROTO_TCP, libc::TCP_REPAIR));
+        assert!(!local_udp_socket_option(libc::IPPROTO_IP, -1));
+        assert!(!local_udp_socket_option(libc::IPPROTO_IPV6, -1));
+    }
+
+    #[test]
+    fn ordinary_rights_require_physical_regular_file_provenance() {
+        use crate::fd::DetFd;
+        use crate::stat::DetStat;
+        use nix::fcntl::OFlag;
+        for ty in [FdType::Regular, FdType::Memfd, FdType::Socket, FdType::Pipe] {
+            let file = DetFd::new(7, OFlag::O_WRONLY, ty,
+                OpenFileId::new(DetTid::from_raw(1), 1));
+            assert!(!ordinary_regular_file(&file));
+            for mode in [libc::S_IFREG, libc::S_IFDIR, libc::S_IFCHR,
+                libc::S_IFIFO, libc::S_IFSOCK] {
+                let file = file.clone().with_stat(DetStat { mode, ..DetStat::default() });
+                assert_eq!(ordinary_regular_file(&file),
+                    matches!(ty, FdType::Regular | FdType::Memfd) && mode == libc::S_IFREG);
+            }
+        }
     }
 
     #[test]
@@ -1188,6 +1325,70 @@ mod tests {
     }
 
     #[test]
+    fn paired_unix_mutations_wake_only_the_connection_but_authority_wakes_all() {
+        let mut deps = Dependencies::default();
+        let mut waiters = BTreeSet::new();
+        for index in 0..32 {
+            let first = OpenFileId::new(DetTid::from_raw(1), 2 * index + 1);
+            let second = OpenFileId::new(DetTid::from_raw(1), 2 * index + 2);
+            for id in [first, second] {
+                deps.update(Update::Socket { key: Key::File(id), domain: SocketDomain::Unix });
+            }
+            let before = deps.observe(vec![Key::File(second)]).unwrap();
+            deps.update(Update::PairUnixStreams { first, second });
+            let tid = DetTid::from_raw(index as i32 + 2);
+            assert!(!deps.register(tid, &before));
+            let after = deps.observe(vec![Key::File(second)]).unwrap();
+            assert!(deps.register(tid, &after));
+            waiters.insert(tid);
+        }
+        let active = DetTid::from_raw(2);
+        // Last-close publication uses the captured OFD after local metadata dies.
+        assert_eq!(deps.update(Update::Change(vec![socket_key(1)])), BTreeSet::from([active]));
+        waiters.remove(&active);
+        assert!(deps.update(Update::Change(vec![Key::SocketDomain(SocketDomain::Unix)])).is_empty());
+        assert_eq!(deps.update(Update::RevokeSocketDomain(SocketDomain::Unix)), waiters);
+        assert!(deps.observe(vec![socket_key(2)]).is_none());
+    }
+
+    #[test]
+    fn unix_pair_promotion_never_reparents_or_restores_unknown_authority() {
+        for revoke_first in [false, true] {
+            let mut deps = Dependencies::default();
+            let ids = [1, 2, 3].map(|index| OpenFileId::new(DetTid::from_raw(1), index));
+            for id in ids {
+                deps.update(Update::Socket { key: Key::File(id), domain: SocketDomain::Unix });
+            }
+            deps.update(Update::PairUnixStreams { first: ids[0], second: ids[1] });
+            if revoke_first {
+                deps.update(Update::RevokeAll);
+            } else {
+                deps.update(Update::PairUnixStreams { first: ids[0], second: ids[2] });
+            }
+            assert!(deps.observe(vec![Key::File(ids[0])]).is_none());
+            assert!(deps.observe(vec![Key::File(ids[2])]).is_none());
+        }
+    }
+
+    #[test]
+    fn unix_pair_generation_exhaustion_never_revalidates_a_snapshot() {
+        let mut deps = Dependencies::default();
+        let first = OpenFileId::new(DetTid::from_raw(1), 1);
+        let second = OpenFileId::new(DetTid::from_raw(1), 2);
+        for id in [first, second] {
+            deps.update(Update::Socket { key: Key::File(id), domain: SocketDomain::Unix });
+        }
+        deps.update(Update::PairUnixStreams { first, second });
+        deps.sources.get_mut(&Key::SocketConnection(first)).unwrap().generation = u64::MAX;
+        let snapshot = deps.observe(vec![Key::File(second)]).unwrap();
+        let tid = DetTid::from_raw(2);
+        assert!(deps.register(tid, &snapshot));
+        assert_eq!(deps.update(Update::Change(vec![Key::File(first)])), BTreeSet::from([tid]));
+        assert!(!deps.register(tid, &snapshot));
+        assert!(deps.observe(vec![Key::File(second)]).is_none());
+    }
+
+    #[test]
     fn unix_domain_wakes_all_subscribers_without_pairing_and_rejects_raced_probe() {
         let mut deps = Dependencies::default();
         let first = socket_key(1);
@@ -1201,7 +1402,7 @@ mod tests {
         let snapshot_b = deps.observe(vec![second]).unwrap();
         assert!(deps.register(a, &snapshot_a));
         assert!(deps.register(b, &snapshot_b));
-        assert_eq!(deps.update(Update::SocketChange(SocketDomain::Unix)), BTreeSet::from([a, b]));
+        assert_eq!(deps.update(Update::Change(vec![Key::SocketDomain(SocketDomain::Unix)])), BTreeSet::from([a, b]));
         assert!(!deps.register(a, &snapshot_a));
         assert!(!deps.register(b, &snapshot_b));
         assert!(deps.observe(vec![first, second]).is_some());

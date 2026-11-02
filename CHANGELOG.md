@@ -6,6 +6,32 @@ branches from 0.5.0.
 
 ## 0.5.3 (Unreleased)
 
+- Give proven Unix stream peers connection-local readiness generations instead
+  of waking every unrelated Unix waiter on each read, write or close. Reuse
+  existing connection custody, retain shared domain authority, and keep stable
+  OFD group identities through dup/fork, replacement, exec and exit. Ambiguous
+  connect/accept order, dequeue errors and post-accept metadata failures prevent
+  promotion; unpaired sockets retain conservative domain mutation dependencies.
+  Socket mutation RPCs carry the captured OFD directly without a temporary key
+  vector. Global RPC revision 24 rejects older dependency-wire definitions.
+- Preserve owned Unix-stream readiness across unrelated producer-local operations:
+  UDP `IP_RECVERR`, `IPV6_RECVERR` and `SO_BROADCAST`, TCP `TCP_INQ`, and scalar
+  Unix datagrams. Admit proven read-only minimal `RTM_GETROUTE` dumps, including
+  the terminal unpadded netlink layout used by Go. Physically proven regular
+  log files passed over guest-held Unix stream socketpairs no longer revoke
+  socket domains; per-file and flock custody accounting remain in force.
+  Unknown options, mutating route requests, transferred sockets, datagram
+  message APIs and active TCP producers retain conservative fallback.
+  Native data/EOF and strict-repeat regressions cover parking and refusal,
+  including discarding a datagram's last queued stream descriptor.
+  `patches/fullstack-postgres-unix.patch` switches the lab Spark harness's SSP,
+  routefinder and operator database clients to private PostgreSQL Unix sockets
+  without changing transactions or deadlines.
+- Add a lab-harness patch that imports SSP once in a persistent, sandboxed
+  bootstrap process. Private Unix-socket commands retain real per-command
+  database contexts, effects, deadlines and failure reporting without caching
+  query results. Document fixed-epoch compatibility with application liquidity
+  cutoffs separately from strict trace repeatability.
 - Integrate upstream Hermit `94cafc22b1ead` and Reverie baseline
   `bca5399182da`, retaining run-local shared memory, event-driven readiness and
   authenticated process-signal dequeue reservations. Forward shared-backing

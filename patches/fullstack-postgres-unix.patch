@@ -1,0 +1,17 @@
+--- a/fullstack-fix/ssp_config.py
++++ b/fullstack-fix/ssp_config.py
+@@ -5 +5 @@
+-DATABASE_URI = 'postgresql://dst@127.0.0.1:25732/sparkcore'
++DATABASE_URI = 'postgresql://dst@/sparkcore?host=/tmp/hermit-fullstack/pg/sock&port=25732'
+--- a/fullstack-fix/services.sh
++++ b/fullstack-fix/services.sh
+@@ -40 +40 @@
+-    exec "$RF/source/server_main" --db-uri 'postgresql://dst@127.0.0.1:25732/sparkcore' --port 28004 --disable-metrics
++    exec "$RF/source/server_main" --db-uri 'postgresql://dst@/sparkcore?host=/tmp/hermit-fullstack/pg/sock&port=25732' --port 28004 --disable-metrics
+--- a/fullstack-fix/spark_bootstrap.py
++++ b/fullstack-fix/spark_bootstrap.py
+@@ -163,2 +163,2 @@
+-            '-database', f'postgresql://dst@127.0.0.1:25732/sparkoperator_{i}?sslmode=disable',
+-            '-ephemeral-database', f'postgresql://dst@127.0.0.1:25732/spark_ephemeral_{i}?sslmode=disable',
++            '-database', f'postgresql://dst@/sparkoperator_{i}?host=/tmp/hermit-fullstack/pg/sock&port=25732&sslmode=disable',
++            '-ephemeral-database', f'postgresql://dst@/spark_ephemeral_{i}?host=/tmp/hermit-fullstack/pg/sock&port=25732&sslmode=disable',

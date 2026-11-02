@@ -14900,12 +14900,25 @@ impl<T: RecordOrReplay> Detcore<T> {
 
             self.maybe_set_nonblocking_fd(guest, fds[0]);
             self.maybe_set_nonblocking_fd(guest, fds[1]);
+            let readiness_pair = if guest.config().event_driven_io
+                && crate::event_driven_io::created_socket_domain(call.family(), call.r#type(), call.protocol())
+                    == Some(crate::event_driven_io::SocketDomain::Unix)
+            {
+                Some((
+                    guest.thread_state().with_detfd(fds[0], |file| file.open_file_id())?,
+                    guest.thread_state().with_detfd(fds[1], |file| file.open_file_id())?,
+                ))
+            } else { None };
             for fd in fds {
                 crate::event_driven_io::socket_created(
                     guest, fd,
                     crate::event_driven_io::created_socket_domain(call.family(), call.r#type(), call.protocol()),
                     false,
                 ).await;
+            }
+            if let Some((first, second)) = readiness_pair {
+                crate::tool_global::event_driven_io(guest,
+                    crate::event_driven_io::Update::PairUnixStreams { first, second }).await;
             }
         }
         Ok(res)
@@ -16386,15 +16399,32 @@ impl<T: RecordOrReplay> Detcore<T> {
             self.execute_nonblockable_fd_syscall(guest, call2).await? as RawFd
         };
 
-        self.add_fd(
+        // Successful nonblocking accept retains its final scheduler turn.
+        // add_fd only injects metadata probes and installs the model; it does
+        // not request another grant, so neither descriptor slot can be reused.
+        if let Err(error) = self.add_fd(
             guest,
             fd,
             // This will specify whether the socket returned is logically non-blocking:
             oflag_from_sock_bits(call.flags().bits()),
             FdType::Socket,
         )
-        .await?;
-        let peer = self.note_unix_accept(guest, call.sockfd(), fd, completes_in_turn);
+        .await {
+            // The native accept already dequeued, even if its metadata probe
+            // failed and add_fd closed the new socket. A later accept must not
+            // reuse this unconsumed FIFO entry as a readiness certificate.
+            if guest.config().event_driven_io {
+                crate::syscalls::scm_rights::uncertain_readiness_connection(guest);
+            }
+            return Err(error.into());
+        }
+        let (peer, readiness_pair) = self.note_unix_accept(guest, call.sockfd(), fd, completes_in_turn);
+        // Capture OFDs before any subsequent RPC or descriptor-table work.
+        let readiness_ids = if guest.config().event_driven_io && readiness_pair {
+            peer.as_ref().and_then(|peer| peer.readiness_unix_stream_id()).and_then(|first| {
+                guest.thread_state().with_detfd(fd, |file| (first, file.open_file_id())).ok()
+            })
+        } else { None };
         guest.thread_state().with_detfd(fd, |detfd| {
             detfd.set_accepted_connection();
             detfd.set_error_queue_never_waits(error_queue_never_waits);
@@ -16415,6 +16445,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await;
         let domain = crate::event_driven_io::socket_domain(guest, call.sockfd());
         crate::event_driven_io::socket_created(guest, fd, domain, false).await;
+        if let Some((first, second)) = readiness_ids {
+            crate::tool_global::event_driven_io(guest,
+                crate::event_driven_io::Update::PairUnixStreams { first, second }).await;
+        }
 
         if physically_nonblocking {
             self.maybe_set_nonblocking_fd(guest, fd);

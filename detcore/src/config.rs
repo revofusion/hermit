@@ -183,6 +183,8 @@ mod tests {
         (22, "ffa1435b142beb82", "94273db60f0db69f"),
         // Adds the stable per-file flock dependency, separate from OFD readiness.
         (23, "26ba7da2fa7d5e12", "94273db60f0db69f"),
+        // Separates socket authority from immutable Unix connection mutations.
+        (24, "90f7bad0100ee8be", "94273db60f0db69f"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that

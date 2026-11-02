@@ -87,8 +87,12 @@ fn hermit_command(scenario: &str) -> Command {
         "--event-driven-io",
         "--base-env=minimal",
     ]);
-    if scenario == "socket-unrelated-producers" {
+    if matches!(scenario, "socket-unrelated-producers" | "socket-rights-regular") {
         command.arg("--clock-multiplier=.001");
+    } else if matches!(scenario, "socket-route-mutation-fallback"
+        | "socket-rights-socket-fallback" | "socket-datagram-message-fallback"
+        | "socket-datagram-discard-fallback") {
+        command.arg("--clock-multiplier=.125");
     }
     // Deliberately retain CPUID virtualization, PMU preemption, and signal
     // custody defaults. RUST_LOG is not narrowed to hide other INFO records.
@@ -131,7 +135,7 @@ fn assert_canonical_verdict(path: &Path, scenario: &str) {
             "{scenario}: no {side} INFO records compared: {report}",
         );
     }
-    if scenario == "socket-unrelated-producers" {
+    if matches!(scenario, "socket-unrelated-producers" | "socket-rights-regular") {
         // At this scenario's clock multiplier, polling through the initial
         // 200ms idle window would cost over 400,000 scheduler turns. Require
         // observable work avoidance in both complete runs, not only parity.
@@ -143,6 +147,18 @@ fn assert_canonical_verdict(path: &Path, scenario: &str) {
                 turns < 10_000,
                 "{scenario}: {run} did not preserve idle parking ({turns} turns): {report}",
             );
+        }
+    }
+    if matches!(scenario, "socket-route-mutation-fallback"
+        | "socket-rights-socket-fallback" | "socket-datagram-message-fallback"
+        | "socket-datagram-discard-fallback")
+    {
+        // Revocation must keep the real consumer working, but must not retain
+        // idle parking across an unproven producer/capability transition.
+        for run in ["run1", "run2"] {
+            let turns = report["runtime"][run]["scheduler_turns"]
+                .as_u64().expect("missing scheduler turns");
+            assert!(turns > 1_000, "{scenario}: {run} did not fail closed: {report}");
         }
     }
 }
@@ -413,6 +429,46 @@ fn socketpair_forked_alias_data_and_shutdown_before_exit() {
 }
 
 #[test]
+fn socket_pathname_connection_groups_preserve_forked_aliases_and_edge_eof() {
+    assert_scenario("socket-connection-groups");
+}
+
+#[test]
+fn socket_failed_accept_never_pairs_the_next_connection_with_a_dequeued_peer() {
+    assert_scenario("socket-accept-error-groups");
+}
+
+#[test]
 fn socket_unrelated_producers_preserve_unix_idle_parking() {
     assert_scenario("socket-unrelated-producers");
+}
+
+#[test]
+fn socket_unknown_udp_option_keeps_unix_consumer_live_via_fallback() {
+    assert_scenario("socket-udp-unknown-option");
+}
+
+#[test]
+fn socket_mutating_route_request_keeps_unix_consumer_live_via_fallback() {
+    assert_scenario("socket-route-mutation-fallback");
+}
+
+#[test]
+fn socket_transferred_socket_keeps_unix_consumer_live_via_fallback() {
+    assert_scenario("socket-rights-socket-fallback");
+}
+
+#[test]
+fn socket_unix_datagram_message_keeps_stream_consumer_live_via_fallback() {
+    assert_scenario("socket-datagram-message-fallback");
+}
+
+#[test]
+fn socket_regular_stderr_and_pipe_rights_preserve_unix_idle_parking() {
+    assert_scenario("socket-rights-regular");
+}
+
+#[test]
+fn socket_unix_datagram_discarded_right_delivers_eof_after_revocation() {
+    assert_scenario("socket-datagram-discard-fallback");
 }

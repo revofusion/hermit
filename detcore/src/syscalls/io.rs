@@ -5229,11 +5229,13 @@ where
                     && file.channel().is_some_and(|end| {
                         matches!(end.channel, crate::pipe_wake::ChannelId::Pipe(_))
                     }))
-                    || (proven_guest_transfer && file.flock_domain().is_some())
+                    || (proven_guest_transfer
+                        && (file.flock_domain().is_some()
+                            || crate::event_driven_io::ordinary_regular_file(file)))
             }).unwrap_or(false)
         });
     if unread || (!sent.is_empty() && !restricted_internal_transfer) {
-        // Anonymous pipes and proven private regular files cannot convey a
+        // Anonymous pipes and physically proven regular files cannot convey a
         // socket/directory/namespace capability. Pipe alias custody remains
         // conservative below; native flock aliases retain their shared domain.
         tracing::info!(target: "detcore::event_driven_io", unread, descriptors = ?sent,
