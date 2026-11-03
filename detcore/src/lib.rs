@@ -7438,9 +7438,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             }
             crate::event_driven_io::after_epoll_progress(guest, call, &res).await;
             if !io_binding_changes.is_empty() {
-                crate::tool_global::event_driven_io(
-                    guest, crate::event_driven_io::Update::Change(io_binding_changes),
-                ).await;
+                // Keep the cold kernel witness/scratch future out of every
+                // syscall's state (`hot_path_futures_stay_small`).
+                Box::pin(crate::event_driven_io::after_binding_changes(
+                    guest, io_binding_changes, res.is_ok(),
+                )).await;
             }
             if crate::fifo_peer::any_orphaned_page() {
                 // Boxed: a rare cleanup, kept out of every syscall's future

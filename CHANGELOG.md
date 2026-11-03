@@ -6,9 +6,14 @@ branches from 0.5.0.
 
 ## 0.5.3 (Unreleased)
 
+- Avoid false anonymous-pipe dependency invalidations on proven nonlast closes.
+  Use a fresh kernel peer-lifetime witness only with an unshared descriptor
+  table; preserve conservative shared-binding, FIFO, missing-authority and
+  configured-latency behavior. Eliminate stale-admission retry amplification
+  without cached endpoint counts or changing the guest's syscall workload.
 - Check idle-poller freshness and thread lifecycle eligibility before reading
   live signal dispositions for terminal deadlock detection. Avoid unnecessary
-  whole-queue `/proc` scans during wake/repark bursts; retain every positive
+  whole-queue `/proc` scans during repeated poll retries; retain every positive
   verdict's signal checks and preserve guest execution and clock accounting.
 - Index frozen host-input mutation coverage in a borrowed, component-ordered
   flat array. Bulk input-set, directory-digest and replay-finalization queries

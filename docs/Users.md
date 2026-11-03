@@ -217,8 +217,20 @@ separately from virtual time; preserve strict repeated-result verification.
 Terminal idle-poller checks first reject stale attempts and runnable, retiring
 or doomed threads using scheduler-owned state. Only a remaining candidate
 requires live signal-disposition checks for every relevant task. This avoids
-whole-queue `/proc` observations during wake/repark bursts without caching
+whole-queue `/proc` observations during repeated poll retries without caching
 signal state, dropping handler checks or changing guest turns and clocks.
+
+Native ptrace event-driven I/O avoids invalidating anonymous-pipe dependencies
+for a proven nonlast close. After a successful close, close-range or descriptor
+replacement, a fresh zero-event, zero-timeout kernel poll of a retained opposite
+endpoint must prove that the closing direction still has a peer. This requires
+an unshared descriptor table and current dependency authority; writer closes
+also require the original reader description. Shared tables, reopened or
+missing witnesses, errors, FIFOs and configured pipe-wake latency retain the
+conservative path. No persistent endpoint counts or readiness cache is added.
+Removing these false generation changes eliminates stale-admission retries;
+it can change charged virtual time and scheduling, so compare complete strict
+repeats of the new runtime rather than claiming old/new trace identity.
 
 ### Bootstrap initialization and policy epochs
 

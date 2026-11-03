@@ -94,6 +94,11 @@ fn hermit_command(scenario: &str) -> Command {
         | "socket-datagram-discard-fallback") {
         command.arg("--clock-multiplier=.125");
     }
+    if scenario == "pipe-shared-bindings" {
+        // Cross-thread close/replacement need not wake native poll early.
+        // Hermit's numeric-fd retry contract must complete before its deadline.
+        command.arg("--env=HERMIT_TEST_BINDING_DEADLINE=1");
+    }
     // Deliberately retain CPUID virtualization, PMU preemption, and signal
     // custody defaults. RUST_LOG is not narrowed to hide other INFO records.
     command
@@ -173,6 +178,9 @@ fn assert_scenario_output(scenario: &str, expected: Option<&str>) {
     let success = format!("{scenario} success\n");
     let mut native = watchdog();
     native.arg(binary).arg(scenario);
+    if scenario == "pipe-shared-bindings" {
+        native.env_remove("HERMIT_TEST_BINDING_DEADLINE");
+    }
     let native = checked_output(native, &format!("native {scenario}"));
     assert!(native.stdout.ends_with(success.as_bytes()));
     if let Some(expected) = expected {
@@ -284,6 +292,36 @@ fn pipe_cloexec_eof_before_child_exit() {
 #[test]
 fn pipe_capacity_wakes_writer() {
     assert_scenario("pipe-capacity");
+}
+
+#[test]
+fn pipe_forked_nonlast_closes_and_last_eof_epipe() {
+    assert_scenario("pipe-close-lifetime");
+}
+
+#[test]
+fn pipe_close_range_aliases_and_last_eof_epipe() {
+    assert_scenario("pipe-close-range-lifetime");
+}
+
+#[test]
+fn pipe_dup_replacement_aliases_and_last_eof_epipe() {
+    assert_scenario("pipe-close-replace-lifetime");
+}
+
+#[test]
+fn pipe_reopened_ownership_keeps_close_fallback() {
+    assert_scenario("pipe-close-reopened-lifetime");
+}
+
+#[test]
+fn pipe_missing_opposite_descriptor_keeps_close_fallback() {
+    assert_scenario("pipe-close-no-witness");
+}
+
+#[test]
+fn pipe_shared_table_bindings_wake_without_last_peer_close() {
+    assert_scenario("pipe-shared-bindings");
 }
 
 #[test]

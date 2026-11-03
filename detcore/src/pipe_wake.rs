@@ -159,6 +159,111 @@ pub(crate) fn progress_of(
     }
 }
 
+/// A fresh kernel witness for an explicit anonymous-pipe close, never a
+/// reference-count or cached-readiness guess. Only native ptrace's serialized
+/// injection/lifecycle barriers are established here; other backends fall back.
+pub(crate) async fn close_keeps_peer<G, T>(
+    guest: &mut G,
+    channel: ChannelId,
+    closed_reads: bool,
+    closed_writes: bool,
+) -> bool
+where
+    G: reverie::Guest<crate::Detcore<T>>,
+    T: crate::record_or_replay::RecordOrReplay,
+{
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (guest, channel, closed_reads, closed_writes);
+        false
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        use crate::event_driven_io::{Key, Update};
+        use reverie::syscalls::{Poll, Syscall};
+
+        let ChannelId::Pipe(original_reader) = channel else {
+            return false;
+        };
+        if !guest.config().event_driven_io
+            || guest.config().pipe_wake_latency_in_effect().is_some()
+            || guest.config().recordreplay_modes
+            || !guest.config().sequentialize_threads
+            || guest.config().backend != reverie::BackendCapabilities::PTRACE
+            || !(closed_reads || closed_writes)
+        {
+            return false;
+        }
+        // The table is already updated. In particular a close_range witness
+        // must survive the entire range, not merely the first removed alias.
+        let (reader, writer) = {
+            let table = guest.thread_state().file_metadata.lock().unwrap();
+            // A sibling sharing this table may be parked on the replaced
+            // descriptor number, even while another alias keeps its OFD alive.
+            // Its binding change must wake independently of pipe lifetime.
+            let Some(process) = guest.thread_state().detpid else {
+                return false;
+            };
+            if !table.has_only_holder(process) {
+                return false;
+            }
+            let mut reader: Option<i32> = None;
+            let mut writer: Option<i32> = None;
+            for (&fd, file) in &table.file_handles {
+                if !file.is_guest_held() {
+                    continue;
+                }
+                let Some(end) = file.channel().filter(|end| end.channel == channel) else {
+                    continue;
+                };
+                // Linux suppresses HUP for a newly opened FIFO reader before
+                // its first writer. Only pipe2's original read OFD (or its
+                // aliases) has the established zero-vs-one writer generation.
+                if closed_writes && end.reads && !end.writes
+                    && file.open_file_id() == original_reader
+                {
+                    reader = Some(reader.map_or(fd, |old| old.min(fd)));
+                }
+                if closed_reads && end.writes && !end.reads {
+                    writer = Some(writer.map_or(fd, |old| old.min(fd)));
+                }
+            }
+            (reader, writer)
+        };
+        if (closed_writes && reader.is_none()) || (closed_reads && writer.is_none()) {
+            return false;
+        }
+        // guest_held alone is not authority: SCM_RIGHTS, reopened pipes,
+        // untracked producers, async IO and fatal signals revoke dependencies.
+        // Observe neither registers a waiter nor grants another guest a turn.
+        if crate::tool_global::event_driven_io(
+            guest, Update::Observe(vec![Key::Pipe(channel)], false),
+        ).await.is_none() {
+            return false;
+        }
+        for fd in [reader, writer].into_iter().flatten() {
+            let mut initial = [0u8; std::mem::size_of::<libc::pollfd>()];
+            initial[..std::mem::size_of::<i32>()].copy_from_slice(&fd.to_ne_bytes());
+            // events=0: HUP/ERR/NVAL are returned unconditionally. No data is
+            // read, no space consumed and no persistent poll registration made.
+            // Ptrace executes the next injection through userspace: the close's
+            // task_work fput has run before this poll. Other implicit releases
+            // are covered by native exit/exec barriers or authority revocation.
+            let probe = crate::syscalls::scratch::inject_with_scratch(guest, initial, |buffer| {
+                Syscall::from(Poll::new().with_fds(Some(buffer.cast())).with_nfds(1).with_timeout(0))
+            }).await;
+            let Ok((0, bytes)) = probe else {
+                return false;
+            };
+            let offset = std::mem::offset_of!(libc::pollfd, revents);
+            if i16::from_ne_bytes([bytes[offset], bytes[offset + 1]]) != 0 {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 impl<T: crate::record_or_replay::RecordOrReplay> crate::Detcore<T> {
     /// The channel end behind `fd` when either pipe handoff or dependency
     /// waiting is enabled and Detcore knows its provenance.
@@ -264,10 +369,10 @@ impl<T: crate::record_or_replay::RecordOrReplay> crate::Detcore<T> {
             .collect()
     }
 
-    /// This thread closed `end` (explicitly: `close`, `close_range`, or a
-    /// `dup2` or `dup3` over it): ready what that closing gives the other
-    /// side. Dependency waits separately revoke authority before exit/exec;
-    /// the latency-only policy does not notify on implicit closes.
+    /// Keep FIFO notifications and the latency policy at their original point,
+    /// including event publication before latency handoff when both are enabled.
+    /// Otherwise anonymous-pipe dependency mutations are published once by
+    /// `event_driven_io::after_binding_changes`. Exit/exec keeps its own barrier.
     pub(crate) async fn note_channel_end_closed<G: reverie::Guest<Self>>(
         &self,
         guest: &mut G,
@@ -276,8 +381,12 @@ impl<T: crate::record_or_replay::RecordOrReplay> crate::Detcore<T> {
         let Some(end) = end else {
             return;
         };
-        for wants in end.close_readies() {
-            self.note_pipe_readied(guest, end.channel, wants).await;
+        if matches!(end.channel, ChannelId::Fifo(_))
+            || self.cfg.pipe_wake_latency_in_effect().is_some()
+        {
+            for wants in end.close_readies() {
+                self.note_pipe_readied(guest, end.channel, wants).await;
+            }
         }
     }
 }

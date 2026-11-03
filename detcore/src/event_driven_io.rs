@@ -1070,16 +1070,108 @@ fn descriptor_flags_ioctl(request: u64) -> bool {
         .contains(&request)
 }
 
+/// Old binding keys and compact closed-direction flags. Ordinary closes and
+/// small ranges keep their flags inline; only larger ranges need flag storage.
+/// The keys are filtered in place and become the final mutation RPC's vector.
+#[derive(Debug, Default)]
+pub(crate) struct BindingChanges {
+    keys: Vec<Key>,
+    closed: [u8; 8],
+    overflow_closed: Vec<u8>,
+}
+
+impl BindingChanges {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    fn from_bindings(bindings: BTreeMap<Key, u8>) -> Self {
+        let mut changes = Self {
+            keys: Vec::with_capacity(bindings.len()),
+            overflow_closed: Vec::with_capacity(bindings.len().saturating_sub(8)),
+            ..Self::default()
+        };
+        for (index, (key, closed)) in bindings.into_iter().enumerate() {
+            changes.keys.push(key);
+            if index < changes.closed.len() {
+                changes.closed[index] = closed;
+            } else {
+                changes.overflow_closed.push(closed);
+            }
+        }
+        changes
+    }
+
+    fn closed_at(&self, index: usize) -> u8 {
+        if index < self.closed.len() {
+            self.closed[index]
+        } else {
+            self.overflow_closed[index - self.closed.len()]
+        }
+    }
+}
+
+fn capture_binding<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+    guest: &G,
+    fd: i32,
+    changes: &mut BTreeMap<Key, u8>,
+) {
+    let binding = guest.thread_state().with_detfd(fd, |file| {
+        descriptor_key(file).map(|key| {
+            let closed = file.channel().map_or(0, |end| {
+                u8::from(end.reads) | (u8::from(end.writes) << 1)
+            });
+            (key, closed)
+        })
+    }).ok().flatten();
+    if let Some((key, closed)) = binding {
+        // A range may close both directions of the same deduplicated key.
+        changes.entry(key).and_modify(|previous| *previous |= closed).or_insert(closed);
+    }
+}
+
+/// Publish explicit binding changes after the physical operation and table update.
+/// The separate latency policy retains its earlier handoff notification.
+/// Failure and unknown ownership retain the conservative mutation report.
+pub(crate) async fn after_binding_changes<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+    guest: &mut G,
+    mut changes: BindingChanges,
+    succeeded: bool,
+) {
+    if succeeded {
+        let mut kept = 0;
+        for index in 0..changes.keys.len() {
+            let key = changes.keys[index];
+            let closed = changes.closed_at(index);
+            if let Key::Pipe(channel) = key
+                && crate::pipe_wake::close_keeps_peer(
+                    guest, channel, closed & 1 != 0, closed & 2 != 0,
+                ).await
+            {
+                continue;
+            }
+            if kept != index {
+                changes.keys[kept] = key;
+            }
+            kept += 1;
+        }
+        changes.keys.truncate(kept);
+    }
+    if !changes.keys.is_empty() {
+        crate::tool_global::event_driven_io(guest, Update::Change(changes.keys)).await;
+    }
+}
+
 /// Revoke unproven kernel mutation authority before forwarding. For ordinary
-/// descriptor replacement return the old object identities instead: the
-/// committed close wakes them without guessing whether a last reference died.
+/// descriptor replacement capture the old binding; `after_binding_changes`
+/// publishes its committed mutation without inferring lifetime from Rust handles.
 pub(crate) async fn before_syscall<G: Guest<Detcore<T>>, T: RecordOrReplay>(
     guest: &mut G,
     call: Syscall,
-) -> Vec<Key> {
+) -> BindingChanges {
     use reverie::syscalls::Sysno;
     if !guest.config().event_driven_io {
-        return Vec::new();
+        return BindingChanges::default();
     }
     let (number, args) = call.into_parts();
     let clone_flags = if number == Sysno::clone {
@@ -1101,7 +1193,7 @@ pub(crate) async fn before_syscall<G: Guest<Detcore<T>>, T: RecordOrReplay>(
     if escapes {
         tracing::info!(target: "detcore::event_driven_io", "event-driven IO disabled before namespace/producer escape {}", number);
         crate::tool_global::event_driven_io(guest, Update::Disable).await;
-        return Vec::new();
+        return BindingChanges::default();
     }
     if number == Sysno::ioctl
         && (descriptor_flags_ioctl(args.arg1 as u64)
@@ -1112,7 +1204,7 @@ pub(crate) async fn before_syscall<G: Guest<Detcore<T>>, T: RecordOrReplay>(
                 })
                 .unwrap_or(false))
     {
-        return Vec::new();
+        return BindingChanges::default();
     }
     let global = matches!(
         number,
@@ -1133,40 +1225,35 @@ pub(crate) async fn before_syscall<G: Guest<Detcore<T>>, T: RecordOrReplay>(
         && matches!(number, Sysno::splice | Sysno::tee | Sysno::vmsplice);
     let diverges = number == Sysno::unshare && (args.arg0 as i32 & libc::CLONE_FILES) != 0;
     if !(global || descriptor.is_some() || range || zero_copy || diverges) {
-        return Vec::new();
+        return BindingChanges::default();
     }
     let update = if diverges || zero_copy {
         Update::Disable
     } else if global {
         Update::RevokeAll
     } else {
-        let mut keys = BTreeSet::new();
+        let mut keys = BTreeMap::new();
         if range {
             for fd in guest.thread_state().open_fds() {
                 if range && !(args.arg0 as u32..=args.arg1 as u32).contains(&(fd as u32)) {
                     continue;
                 }
-                if let Some(key) = key(guest, fd) {
-                    keys.insert(key);
-                }
+                capture_binding(guest, fd, &mut keys);
             }
         } else if let Some(fd) = descriptor {
-            if let Some(key) = key(guest, fd) {
-                keys.insert(key);
-            }
+            capture_binding(guest, fd, &mut keys);
         }
         if keys.is_empty() {
-            return Vec::new();
+            return BindingChanges::default();
         }
-        let keys: Vec<_> = keys.into_iter().collect();
         if range || matches!(number, Sysno::close | Sysno::dup2 | Sysno::dup3) {
-            return keys;
+            return BindingChanges::from_bindings(keys);
         }
-        Update::Revoke(keys)
+        Update::Revoke(keys.into_keys().collect())
     };
     tracing::info!(target: "detcore::event_driven_io", "event-driven IO authority revoked before {}", number);
     crate::tool_global::event_driven_io(guest, update).await;
-    Vec::new()
+    BindingChanges::default()
 }
 
 pub(crate) async fn after_fd_progress<G: Guest<Detcore<T>>, T: RecordOrReplay>(
@@ -1211,6 +1298,29 @@ pub(crate) async fn after_epoll_progress<G: Guest<Detcore<T>>, T: RecordOrReplay
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binding_directions_keep_key_order_across_inline_and_spilled_ranges() {
+        for count in [0usize, 1, 8, 9, 17] {
+            let bindings = (0..count).map(|index| {
+                (Key::File(OpenFileId::new(DetTid::from_raw(1), index as u64)),
+                 (index % 4) as u8)
+            }).collect();
+            let changes = BindingChanges::from_bindings(bindings);
+            assert_eq!(changes.is_empty(), count == 0);
+            assert_eq!(changes.keys.len(), count);
+            assert_eq!(changes.overflow_closed.len(), count.saturating_sub(8));
+            if count <= 8 {
+                assert_eq!(changes.overflow_closed.capacity(), 0);
+            }
+            for index in 0..count {
+                assert_eq!(changes.keys[index],
+                    Key::File(OpenFileId::new(DetTid::from_raw(1), index as u64)));
+                assert_eq!(changes.closed_at(index), (index % 4) as u8);
+            }
+        }
+    }
+
     #[test]
     fn unix_datagrams_never_admit_message_or_unknown_capabilities() {
         use reverie::syscalls::Sysno;

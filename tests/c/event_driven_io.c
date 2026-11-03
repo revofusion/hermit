@@ -398,6 +398,183 @@ static void pipe_cloexec(void) {
   puts("pipe: CLOEXEC EOF while exec child remains alive");
 }
 
+/* Close two aliases either individually, together, or by replacing them.
+ * Replacement keeps the peer alive until the acknowledgement: exit cannot
+ * rescue a missed EOF/EPIPE wake. Failed and same-fd dup2 are no-ops. */
+static void close_pipe_aliases(int how, int replacement) {
+  CHECK(dup2(100, 100) == 100);
+  errno = 0;
+  CHECK(dup2(-1, 100) == -1 && errno == EBADF);
+  if (how == 1) {
+    CHECK(syscall(SYS_close_range, 100U, 101U, 0) == 0);
+  } else if (how == 2) {
+    CHECK(dup2(replacement, 100) == 100);
+    CHECK(dup3(replacement, 101, O_CLOEXEC) == 101);
+    CHECK(close(100) == 0);
+    CHECK(close(101) == 0);
+  } else {
+    CHECK(close(100) == 0);
+    CHECK(close(101) == 0);
+  }
+}
+
+static void pipe_close_lifetime(int how, int reopened) {
+  CHECK(signal(SIGPIPE, SIG_IGN) != SIG_ERR);
+  for (int closing_readers = 0; closing_readers <= 1; ++closing_readers) {
+    int data[2], gate[2], ack[2];
+    CHECK(pipe2(data, O_NONBLOCK) == 0);
+    make_pipe(gate);
+    make_pipe(ack);
+    if (closing_readers) {
+      char buffer[4096];
+      memset(buffer, 'f', sizeof(buffer));
+      for (;;) {
+        ssize_t count = write(data[1], buffer, sizeof(buffer));
+        if (count == -1) {
+          CHECK(errno == EAGAIN);
+          break;
+        }
+        CHECK(count > 0);
+      }
+    }
+    CHECK(fcntl(data[0], F_SETFL, 0) == 0);
+    CHECK(fcntl(data[1], F_SETFL, 0) == 0);
+    if (how == 1) {
+      /* One deduplicated key must remember BOTH closed directions. */
+      CHECK(fcntl(data[0], F_DUPFD, 100) == 100);
+      CHECK(fcntl(data[1], F_DUPFD, 101) == 101);
+      CHECK(syscall(SYS_close_range, 100U, 101U, 0) == 0);
+    }
+    if (reopened) {
+      char path[64];
+      CHECK(snprintf(path, sizeof(path), "/proc/self/fd/%d", data[0]) > 0);
+      int unknown = open(path, O_RDONLY | O_NONBLOCK);
+      CHECK(unknown >= 0);
+      CHECK(close(unknown) == 0);
+    }
+    int side = closing_readers ? 0 : 1;
+    CHECK(fcntl(data[side], F_DUPFD, 100) == 100);
+    CHECK(fcntl(data[side], F_DUPFD, 101) == 101);
+    CHECK(close(data[side]) == 0);
+    pid_t child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+      close_pipe_aliases(how, gate[0]);
+      /* Root retains both aliases: these child closes cannot be last. */
+      expect_poll(data[1 - side], closing_readers ? POLLOUT : POLLIN, 0);
+      put_byte(ack[1], 'r');
+      get_byte(gate[0], 'g');
+      if (closing_readers) {
+        errno = 0;
+        CHECK(write(data[1], "x", 1) == -1 && errno == EPIPE);
+        expect_poll(data[1], 0, POLLERR);
+      } else {
+        expect_eof(data[0]);
+        expect_poll(data[0], 0, POLLHUP);
+      }
+      put_byte(ack[1], 'e');
+      get_byte(gate[0], 'q');
+      _exit(0);
+    }
+    get_byte(ack[0], 'r');
+    put_byte(gate[1], 'g');
+    wait_for_consumer();
+    /* With an opposite end in THIS table, the final close must reject the
+     * fresh witness, not mistake deferred fput for a peer. Without one,
+     * notification must conservatively survive without probing anything. */
+    if (how == 3) {
+      CHECK(close(data[1 - side]) == 0);
+    }
+    close_pipe_aliases(how, gate[0]);
+    get_byte(ack[0], 'e');
+    put_byte(gate[1], 'q');
+    joined(child);
+    if (how != 3) {
+      CHECK(close(data[1 - side]) == 0);
+    }
+    CHECK(close(gate[0]) == 0);
+    CHECK(close(gate[1]) == 0);
+    CHECK(close(ack[0]) == 0);
+    CHECK(close(ack[1]) == 0);
+  }
+  puts("pipe: root-retained aliases forbid early EOF/EPIPE; final close wakes before exit");
+}
+
+struct shared_pipe_binding {
+  int how;
+  int watched;
+  int replacement;
+  int gate;
+  int ack;
+};
+
+static void* replace_shared_pipe_binding(void* argument) {
+  struct shared_pipe_binding* change = argument;
+  get_byte(change->gate, 'g');
+  wait_for_consumer();
+  if (change->how == 0) {
+    CHECK(dup2(change->replacement, change->watched) == change->watched);
+  } else if (change->how == 1) {
+    CHECK(close(change->watched) == 0);
+  } else {
+    CHECK(syscall(SYS_close_range, (unsigned)change->watched,
+                  (unsigned)change->watched, 0) == 0);
+  }
+  /* Retain old reader aliases and writers until the poller acknowledges.
+   * Neither EOF nor thread exit may rescue the descriptor-binding wake. */
+  get_byte(change->ack, 'a');
+  return NULL;
+}
+
+static void pipe_shared_bindings(void) {
+  for (int how = 0; how != 3; ++how) {
+    int old[2], ready[2], gate[2], ack[2];
+    make_pipe(old);
+    make_pipe(ready);
+    make_pipe(gate);
+    make_pipe(ack);
+    int watched = dup(old[0]);
+    CHECK(watched >= 0);
+    put_byte(ready[1], 'r');
+    struct shared_pipe_binding change = {
+        how, watched, ready[0], gate[0], ack[0]};
+    pthread_t producer;
+    CHECK(pthread_create(&producer, NULL, replace_shared_pipe_binding, &change) == 0);
+    expect_poll(watched, POLLIN, 0);
+    put_byte(gate[1], 'g');
+    /* Linux need not wake a cross-thread poll on close/replacement itself.
+     * Native may recheck at the finite timeout. Hermit's numeric-fd retry
+     * contract must instead complete before that virtual deadline, so a
+     * missing binding wake cannot be rescued by timeout. Both modes make
+     * the same real IO and clock calls; only Hermit asserts early progress. */
+    struct pollfd item = {.fd = watched, .events = POLLIN};
+    struct timespec started, finished;
+    CHECK(clock_gettime(CLOCK_MONOTONIC, &started) == 0);
+    int result = poll(&item, 1, 500);
+    CHECK(clock_gettime(CLOCK_MONOTONIC, &finished) == 0);
+    CHECK(result == 1);
+    CHECK(item.revents == (how == 0 ? POLLIN : POLLNVAL));
+    if (getenv("HERMIT_TEST_BINDING_DEADLINE") != NULL) {
+      int64_t elapsed = (finished.tv_sec - started.tv_sec) * INT64_C(1000000000)
+          + finished.tv_nsec - started.tv_nsec;
+      CHECK(elapsed >= 0 && elapsed < INT64_C(500000000));
+    }
+    put_byte(ack[1], 'a');
+    CHECK(pthread_join(producer, NULL) == 0);
+    if (how == 0) {
+      get_byte(watched, 'r');
+      CHECK(close(watched) == 0);
+    }
+    for (int side = 0; side != 2; ++side) {
+      CHECK(close(old[side]) == 0);
+      CHECK(close(ready[side]) == 0);
+      CHECK(close(gate[side]) == 0);
+      CHECK(close(ack[side]) == 0);
+    }
+  }
+  puts("pipe: shared-table replacement and closes wake the original numeric-fd waiter");
+}
+
 static void pipe_capacity(void) {
   int data[2], ready[2];
   CHECK(pipe2(data, O_NONBLOCK) == 0);
@@ -1745,6 +1922,18 @@ int main(int argc, char** argv) {
     pipe_cloexec();
   } else if (strcmp(argv[1], "pipe-capacity") == 0) {
     pipe_capacity();
+  } else if (strcmp(argv[1], "pipe-close-lifetime") == 0) {
+    pipe_close_lifetime(0, 0);
+  } else if (strcmp(argv[1], "pipe-close-range-lifetime") == 0) {
+    pipe_close_lifetime(1, 0);
+  } else if (strcmp(argv[1], "pipe-close-replace-lifetime") == 0) {
+    pipe_close_lifetime(2, 0);
+  } else if (strcmp(argv[1], "pipe-close-reopened-lifetime") == 0) {
+    pipe_close_lifetime(0, 1);
+  } else if (strcmp(argv[1], "pipe-close-no-witness") == 0) {
+    pipe_close_lifetime(3, 0);
+  } else if (strcmp(argv[1], "pipe-shared-bindings") == 0) {
+    pipe_shared_bindings();
   } else if (strcmp(argv[1], "poll-timeout") == 0) {
     poll_timeout();
   } else if (strcmp(argv[1], "masked-ppoll-signal-fallback") == 0) {

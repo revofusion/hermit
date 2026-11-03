@@ -1383,6 +1383,12 @@ impl FileMetadata {
         self.holders = BTreeMap::from([(process, 1)]);
     }
 
+    /// Whether this caller is the table's only guest thread. An unknown
+    /// holder set is not proof, and tool handles/snapshots do not count.
+    pub(crate) fn has_only_holder(&self, process: DetPid) -> bool {
+        self.holders.len() == 1 && self.holders.get(&process) == Some(&1)
+    }
+
     /// A thread of `process` that holds this table exits, with its whole
     /// process where `whole_process` (an `exit_group`, which ends every
     /// thread of it). Returns whether that left the table to no holder: then
