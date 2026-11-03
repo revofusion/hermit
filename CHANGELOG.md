@@ -6,6 +6,16 @@ branches from 0.5.0.
 
 ## 0.5.3 (Unreleased)
 
+- Park eligible virtual-timerfd waits on existing dependency generations and
+  virtual deadlines. Carry fresh process-local publication identities through
+  recursive epoll observation, reusing timer enumeration rather than caching
+  descriptor visibility. Arm, rearm, disarm, expiration and consumption wake
+  affected waits; signal, lifecycle and unsupported-source safeguards remain.
+  Global RPC revision 25 carries the new observation evidence.
+- Preserve native-ptrace timerfd consumption after a faulting read or readv,
+  independently of dependency parking. Distinguish pre-read iovec faults from
+  post-consumption copyout faults using a fresh physical readiness witness,
+  preventing an already consumed periodic expiration from being counted twice.
 - Avoid false anonymous-pipe dependency invalidations on proven nonlast closes.
   Use a fresh kernel peer-lifetime witness only with an unshared descriptor
   table; preserve conservative shared-binding, FIFO, missing-authority and

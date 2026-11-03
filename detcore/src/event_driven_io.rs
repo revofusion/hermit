@@ -75,13 +75,15 @@ pub struct Snapshot(pub Vec<(Key, u64)>, pub(crate) Option<Observer>);
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Update {
     Create(Key, bool),
+    /// A traced, model-owned virtual timer, never a host-timed/foreign OFD.
+    Timerfd(OpenFileId),
     Socket { key: Key, domain: SocketDomain },
     PairUnixStreams { first: OpenFileId, second: OpenFileId },
     SocketChange(OpenFileId),
     RevokeSocketDomain(SocketDomain),
     SuspendSocketProbe(SocketProbe),
     SettleSocketProbe { probe: SocketProbe, no_effect: bool },
-    Observe(Vec<Key>, bool),
+    Observe(Vec<Key>, bool, Vec<OpenFileId>),
     Unsupported,
     Change(Vec<Key>),
     Revoke(Vec<Key>),
@@ -116,6 +118,7 @@ struct Source {
     // unknown target: it prevents parking until the instance is retired.
     interests: Option<BTreeMap<(i32, Option<OpenFileId>), Interest>>,
     signalfd_mask: Option<u64>,
+    virtual_timerfd: bool,
     socket_domain: Option<SocketDomain>,
     socket_connection: Option<OpenFileId>,
     pending_socket_probe: Option<SocketProbe>,
@@ -160,6 +163,7 @@ impl Dependencies {
         key: Key,
         observer: Option<Observer>,
         compatible: bool,
+        publishable_timerfds: &[OpenFileId],
         visited: &mut BTreeSet<(Key, bool)>,
         found: &mut BTreeMap<Key, u64>,
     ) -> Result<(), Unavailable> {
@@ -172,12 +176,23 @@ impl Dependencies {
         if self.disabled || source.revoked || source.pending_socket_probe.is_some() {
             return Err(Unavailable::Revoked(key));
         }
+        if source.virtual_timerfd {
+            let Key::File(id) = key else {
+                return Err(Unavailable::Unknown(key));
+            };
+            // Evidence belongs to this probe, not to the epoll ADD task or a
+            // surviving alias in another process. A disarmed timer needs this
+            // authority too: a subsequent arm must wake and re-publish it.
+            if !publishable_timerfds.contains(&id) {
+                return Err(Unavailable::Unknown(key));
+            }
+        }
         found.insert(key, source.generation);
         if let Some(domain) = source.socket_domain {
-            self.collect(Key::SocketAuthority(domain), observer, compatible, visited, found)?;
+            self.collect(Key::SocketAuthority(domain), observer, compatible, publishable_timerfds, visited, found)?;
             let mutation = source.socket_connection.map_or(
                 Key::SocketDomain(domain), Key::SocketConnection);
-            self.collect(mutation, observer, compatible, visited, found)?;
+            self.collect(mutation, observer, compatible, publishable_timerfds, visited, found)?;
         }
         if let Some(mask) = source.signalfd_mask {
             let observer = observer.ok_or(Unavailable::Unknown(key))?;
@@ -214,6 +229,7 @@ impl Dependencies {
                     compatible && observer.zip(interest.observer).is_some_and(|(now, add)| {
                         now.thread == add.thread && now.process == add.process && now.mm == add.mm
                     }),
+                    publishable_timerfds,
                     visited,
                     found,
                 )?;
@@ -224,8 +240,9 @@ impl Dependencies {
 
     /// Count syscall admissions, not the number of legacy fallback retries,
     /// whose physical host completion can vary independently of guest order.
+    #[cfg(test)]
     pub(crate) fn observe_attempt(&mut self, keys: Vec<Key>, first: bool) -> Option<Snapshot> {
-        self.observe_from(keys, first, None)
+        self.observe_from(keys, first, None, &[])
     }
 
     pub(crate) fn observe_from(
@@ -233,6 +250,7 @@ impl Dependencies {
         keys: Vec<Key>,
         first: bool,
         observer: Option<Observer>,
+        publishable_timerfds: &[OpenFileId],
     ) -> Option<Snapshot> {
         if first {
             self.counters.observations += 1;
@@ -243,7 +261,7 @@ impl Dependencies {
         let mut found = BTreeMap::new();
         let mut visited = BTreeSet::new();
         for key in keys {
-            match self.collect(key, observer, true, &mut visited, &mut found) {
+            match self.collect(key, observer, true, publishable_timerfds, &mut visited, &mut found) {
                 Ok(()) => {}
                 Err(Unavailable::Unknown(source)) => {
                     if first {
@@ -401,6 +419,15 @@ impl Dependencies {
                     interests: epoll.then(BTreeMap::new),
                     ..Source::default()
                 });
+                return BTreeSet::new();
+            }
+            Update::Timerfd(id) => {
+                if !self.disabled {
+                    self.sources.entry(Key::File(id)).or_insert_with(|| Source {
+                        virtual_timerfd: true,
+                        ..Source::default()
+                    });
+                }
                 return BTreeSet::new();
             }
             Update::Signalfd { key, mask, create } => {
@@ -576,6 +603,7 @@ fn descriptor_key(file: &crate::fd::DetFd) -> Option<Key> {
     match file.ty() {
         FdType::Regular => file.flock_domain().map(|domain| domain.key),
         FdType::Eventfd | FdType::Epoll | FdType::Signalfd => Some(Key::File(file.open_file_id())),
+        FdType::Timerfd if file.virtual_timerfd().is_some() => Some(Key::File(file.open_file_id())),
         FdType::Socket if file.socket_domain().is_some() => Some(Key::File(file.open_file_id())),
         FdType::Pipe => file.channel().map(|end| Key::Pipe(end.channel)),
         _ => None,
@@ -638,6 +666,7 @@ pub(crate) async fn observe<G: Guest<Detcore<T>>, T: RecordOrReplay>(
     guest: &mut G,
     call: Syscall,
     attempt: u32,
+    publishable_timerfds: Vec<OpenFileId>,
 ) -> Option<Box<Snapshot>> {
     if !guest.config().event_driven_io {
         return None;
@@ -648,7 +677,7 @@ pub(crate) async fn observe<G: Guest<Detcore<T>>, T: RecordOrReplay>(
         }
         return None;
     };
-    crate::tool_global::event_driven_io(guest, Update::Observe(keys, attempt == 0))
+    crate::tool_global::event_driven_io(guest, Update::Observe(keys, attempt == 0, publishable_timerfds))
         .await
         .map(Box::new)
 }
@@ -660,7 +689,13 @@ pub(crate) async fn created<G: Guest<Detcore<T>>, T: RecordOrReplay>(
 ) {
     if guest.config().event_driven_io {
         if let Some(key) = key(guest, fd) {
-            crate::tool_global::event_driven_io(guest, Update::Create(key, epoll)).await;
+            let update = match key {
+                Key::File(id) if guest.thread_state().with_detfd(fd, |file| {
+                    file.ty() == FdType::Timerfd && file.virtual_timerfd().is_some()
+                }).unwrap_or(false) => Update::Timerfd(id),
+                _ => Update::Create(key, epoll),
+            };
+            crate::tool_global::event_driven_io(guest, update).await;
         }
     }
 }
@@ -1266,6 +1301,11 @@ pub(crate) async fn after_fd_progress<G: Guest<Detcore<T>>, T: RecordOrReplay>(
     }
     if let Some((fd, _)) = crate::pipe_wake::progress_of(&call) {
         if socket_domain(guest, fd).is_some() { return; }
+        // Timerfd completion owns both successful and error-after-drain
+        // notifications, before replacing the native count in guest memory.
+        if guest.thread_state().with_detfd(fd, |file| {
+            file.ty() == FdType::Timerfd && file.virtual_timerfd().is_some()
+        }).unwrap_or(false) { return; }
         // Pipe attempts (including partial writes) already publish through the
         // channel hook. Eventfd reads/writes have no partial-byte success.
         if let Some(Key::File(id)) = key(guest, fd) {
@@ -1931,7 +1971,7 @@ mod tests {
     }
 
     fn signal_snapshot(deps: &mut Dependencies, keys: Vec<Key>, who: Observer) -> Snapshot {
-        deps.observe_from(keys, true, Some(who)).unwrap()
+        deps.observe_from(keys, true, Some(who), &[]).unwrap()
     }
 
     #[test]
@@ -2018,16 +2058,16 @@ mod tests {
         for mask in [None, Some(bit(libc::SIGCHLD))] {
             let mut deps = Dependencies::default();
             deps.update(Update::Signalfd { key: key(), mask, create: true });
-            assert!(deps.observe_from(vec![key()], true, Some(who)).is_none());
+            assert!(deps.observe_from(vec![key()], true, Some(who), &[]).is_none());
         }
         let mut deps = Dependencies::default();
         deps.update(Update::Signalfd { key: key(), mask: Some(bit(libc::SIGUSR1)), create: false });
-        assert!(deps.observe_from(vec![key()], true, Some(who)).is_none());
+        assert!(deps.observe_from(vec![key()], true, Some(who), &[]).is_none());
         signalfd(&mut deps, key(), bit(libc::SIGUSR1));
         assert!(deps.observe(vec![key()]).is_none());
         deps.update(Update::Revoke(vec![key()]));
         signalfd(&mut deps, key(), bit(libc::SIGUSR2));
-        assert!(deps.observe_from(vec![key()], true, Some(who)).is_none());
+        assert!(deps.observe_from(vec![key()], true, Some(who), &[]).is_none());
     }
 
     #[test]
@@ -2045,14 +2085,14 @@ mod tests {
             assert_eq!(deps.exclude_signals(process, bit(libc::SIGUSR1)), BTreeSet::from([a.thread]));
             assert!(!deps.register(a.thread, &sa));
             assert_eq!(deps.register(b.thread, &sb), !container);
-            assert!(deps.observe_from(vec![fd], true, Some(a)).is_none());
-            assert_eq!(deps.observe_from(vec![fd], true, Some(b)).is_some(), !container);
+            assert!(deps.observe_from(vec![fd], true, Some(a), &[]).is_none());
+            assert_eq!(deps.observe_from(vec![fd], true, Some(b), &[]).is_some(), !container);
         }
         let mut deps = Dependencies::default();
         let who = observer(10, 10);
         deps.exclude_signals(Some(who.process), bit(libc::SIGUSR1));
         signalfd(&mut deps, key(), bit(libc::SIGUSR1));
-        assert!(deps.observe_from(vec![key()], true, Some(who)).is_none());
+        assert!(deps.observe_from(vec![key()], true, Some(who), &[]).is_none());
     }
 
     fn epoll_interest(deps: &mut Dependencies, epoll: Key, target: Key, operation: i32, who: Observer) {
@@ -2072,14 +2112,14 @@ mod tests {
         signalfd(&mut deps, fd, bit(libc::SIGUSR1));
         deps.update(Update::Create(epoll, true));
         epoll_interest(&mut deps, epoll, fd, libc::EPOLL_CTL_ADD, parent);
-        assert!(deps.observe_from(vec![epoll], true, Some(parent)).is_some());
-        assert!(deps.observe_from(vec![epoll], true, Some(child)).is_none());
+        assert!(deps.observe_from(vec![epoll], true, Some(parent), &[]).is_some());
+        assert!(deps.observe_from(vec![epoll], true, Some(child), &[]).is_none());
         epoll_interest(&mut deps, epoll, fd, libc::EPOLL_CTL_MOD, child);
-        assert!(deps.observe_from(vec![epoll], true, Some(child)).is_none());
-        assert!(deps.observe_from(vec![epoll], true, Some(parent)).is_some());
+        assert!(deps.observe_from(vec![epoll], true, Some(child), &[]).is_none());
+        assert!(deps.observe_from(vec![epoll], true, Some(parent), &[]).is_some());
         epoll_interest(&mut deps, epoll, fd, libc::EPOLL_CTL_DEL, child);
         epoll_interest(&mut deps, epoll, fd, libc::EPOLL_CTL_ADD, child);
-        assert!(deps.observe_from(vec![epoll], true, Some(child)).is_some());
+        assert!(deps.observe_from(vec![epoll], true, Some(child), &[]).is_some());
     }
 
     #[test]
@@ -2097,7 +2137,131 @@ mod tests {
         epoll_interest(&mut deps, outer, inner, libc::EPOLL_CTL_ADD, parent);
         // The first root is compatible. The second reaches those same nodes
         // through an inherited edge and must not be skipped as already seen.
-        assert!(deps.observe_from(vec![inner, outer], true, Some(child)).is_none());
-        assert!(deps.observe_from(vec![fd, outer], true, Some(child)).is_none());
+        assert!(deps.observe_from(vec![inner, outer], true, Some(child), &[]).is_none());
+        assert!(deps.observe_from(vec![fd, outer], true, Some(child), &[]).is_none());
+    }
+
+    #[test]
+    fn timerfd_requires_positive_model_and_fresh_local_publication() {
+        let id = OpenFileId::new(DetTid::from_raw(1), 30);
+        let file = crate::fd::DetFd::new(7, nix::fcntl::OFlag::empty(), FdType::Timerfd, id);
+        assert_eq!(descriptor_key(&file), None);
+        file.set_virtual_timerfd(Some(crate::fd::VirtualTimerfd::default()));
+        let key = Key::File(id);
+        assert_eq!(descriptor_key(&file), Some(key));
+        assert_eq!(descriptor_key(&file.clone().with_fd(8)), Some(key));
+        let mut deps = Dependencies::default();
+        // Physical visibility alone does not certify an unknown source.
+        assert!(deps.observe_from(vec![key], true, None, &[id]).is_none());
+        deps.update(Update::Timerfd(id));
+        assert!(deps.observe(vec![key]).is_none());
+        assert!(deps.observe_from(vec![key], true, None, &[id]).is_some());
+        // Coverage is per observation, not a sticky visibility cache.
+        assert!(deps.observe(vec![key]).is_none());
+        assert!(deps.observe_from(vec![key], true, None, &[id]).is_some());
+        deps.update(Update::Revoke(vec![key]));
+        deps.update(Update::Timerfd(id));
+        assert!(deps.observe_from(vec![key], true, None, &[id]).is_none());
+    }
+
+    #[test]
+    fn timerfd_nested_epoll_requires_every_leaf_even_after_fork() {
+        let parent = observer(10, 10);
+        let child = observer(20, 20);
+        let id = OpenFileId::new(parent.thread, 30);
+        let later_id = OpenFileId::new(parent.thread, 31);
+        let timer = Key::File(id);
+        let inner = Key::File(OpenFileId::new(parent.thread, 32));
+        let outer = Key::File(OpenFileId::new(parent.thread, 33));
+        let mut deps = Dependencies::default();
+        deps.update(Update::Timerfd(id));
+        deps.update(Update::Create(inner, true));
+        deps.update(Update::Create(outer, true));
+        epoll_interest(&mut deps, inner, timer, libc::EPOLL_CTL_ADD, parent);
+        epoll_interest(&mut deps, outer, inner, libc::EPOLL_CTL_ADD, parent);
+        assert!(deps.observe_from(vec![outer], true, Some(child), &[]).is_none());
+        // Timer publication, unlike signalfd queue provenance, may use an
+        // inherited alias in another task if the observing table holds it.
+        let before_add = deps.observe_from(vec![outer], true, Some(child), &[id]).unwrap();
+        assert!(deps.register(child.thread, &before_add));
+        deps.update(Update::Timerfd(later_id));
+        let wake = deps.update_from(Update::Epoll {
+            epoll: inner, fd: 9, identity: Some(later_id),
+            target: Some(Key::File(later_id)), operation: libc::EPOLL_CTL_ADD,
+        }, Some(parent));
+        assert_eq!(wake, BTreeSet::from([child.thread]));
+        assert!(!deps.register(child.thread, &before_add));
+        // Parent adds to the shared epoll after child fork: child still cannot
+        // publish the new leaf even though the source and graph are known.
+        assert!(deps.observe_from(vec![outer], true, Some(child), &[id]).is_none());
+        assert!(deps.observe_from(vec![outer], true, Some(parent), &[id, later_id]).is_some());
+        deps.update(Update::Epoll {
+            epoll: inner, fd: 9, identity: Some(later_id),
+            target: None, operation: libc::EPOLL_CTL_DEL,
+        });
+        assert!(deps.observe_from(vec![outer], true, Some(child), &[id]).is_some());
+    }
+
+    #[test]
+    fn timerfd_effects_wake_shared_waiters_and_reject_pre_effect_generations() {
+        let first = DetTid::from_raw(10);
+        let second = DetTid::from_raw(20);
+        let id = OpenFileId::new(first, 30);
+        let timer = Key::File(id);
+        let epoll = Key::File(OpenFileId::new(first, 31));
+        let mut deps = Dependencies::default();
+        deps.update(Update::Timerfd(id));
+        deps.update(Update::Create(epoll, true));
+        epoll_interest(&mut deps, epoll, timer, libc::EPOLL_CTL_ADD, observer(10, 10));
+        // Arm/rearm/disarm, expiration/drain and physical binding replacement
+        // all commit Change on this shared OFD, not a descriptor-local key.
+        for _ in 0..6 {
+            let direct = deps.observe_from(vec![timer], true, None, &[id]).unwrap();
+            let nested = deps.observe_from(vec![epoll], true, None, &[id]).unwrap();
+            assert!(deps.register(first, &direct));
+            assert!(deps.register(second, &nested));
+            assert_eq!(deps.update(Update::Change(vec![timer])), BTreeSet::from([first, second]));
+            assert!(!deps.register(first, &direct));
+            assert!(!deps.register(second, &nested));
+            assert!(deps.observe_from(vec![epoll], true, None, &[]).is_none());
+        }
+        // Missing publication cannot grant authority to unrelated unknown
+        // leaves, nor can a fresh timer witness hide a revoked dependency.
+        let unknown = Key::File(OpenFileId::new(first, 40));
+        assert!(deps.observe_from(vec![timer, unknown], true, None, &[id]).is_none());
+        deps.update(Update::Create(unknown, false));
+        deps.update(Update::Revoke(vec![unknown]));
+        assert!(deps.observe_from(vec![timer, unknown], true, None, &[id]).is_none());
+    }
+
+    #[test]
+    fn timerfd_fork_exec_alias_survivor_needs_current_table_evidence() {
+        use crate::tool_local::FileMetadata;
+        use nix::fcntl::OFlag;
+        let owner = DetTid::from_raw(10);
+        let child = DetTid::from_raw(20);
+        let id = OpenFileId::new(owner, 30);
+        let timer = Key::File(id);
+        let file = crate::fd::DetFd::new(7, OFlag::O_CLOEXEC, FdType::Timerfd, id);
+        file.set_virtual_timerfd(Some(crate::fd::VirtualTimerfd::default()));
+        let mut parent = FileMetadata::new(owner);
+        parent.file_handles.insert(7, file.clone());
+        parent.file_handles.insert(8, file.clone().with_fd(8).with_fd_flags(OFlag::empty()));
+        let forked = parent.fork_for(child);
+        let mut executed = forked.for_exec(child);
+        assert!(!executed.file_handles.contains_key(&7));
+        assert_eq!(descriptor_key(&executed.file_handles[&8]), Some(timer));
+        let mut deps = Dependencies::default();
+        deps.update(Update::Timerfd(id));
+        let old = deps.observe_from(vec![timer], true, None, &[id]).unwrap();
+        assert!(deps.register(child, &old));
+        assert_eq!(deps.update(Update::Change(vec![timer])), BTreeSet::from([child]));
+        assert!(!deps.register(child, &old));
+        assert!(deps.observe_from(vec![timer], true, None, &[id]).is_some());
+        executed.file_handles.remove(&8);
+        // Parent still owns both aliases; this does not certify child.
+        assert!(file.virtual_timerfd().is_some());
+        assert!(deps.observe_from(vec![timer], true, None, &[]).is_none());
+        assert!(deps.observe_from(vec![timer], true, None, &[id]).is_some());
     }
 }

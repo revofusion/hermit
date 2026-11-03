@@ -23654,7 +23654,7 @@ mod test {
             .event_driven_io_from(
                 waiter,
                 mm,
-                crate::event_driven_io::Update::Observe(vec![key], true),
+                crate::event_driven_io::Update::Observe(vec![key], true, Vec::new()),
             )
             .unwrap();
         let mut request = Resources::new(waiter);
@@ -23756,7 +23756,7 @@ mod test {
                 signalfd_dependency_family(Signal::SIGUSR1);
             let mm = scheduler.thread_mm(leader).unwrap();
             let snapshot = scheduler
-                .event_driven_io_from(leader, mm, Update::Observe(vec![key], true))
+                .event_driven_io_from(leader, mm, Update::Observe(vec![key], true, Vec::new()))
                 .unwrap();
             park_signalfd_dependency(&mut scheduler, sibling, key);
             scheduler.record_host_timed_signals(leader, scope, kernel_signal_bit(libc::SIGUSR2));
@@ -23766,7 +23766,7 @@ mod test {
             assert!(!scheduler.io_dependencies.as_mut().unwrap().register(leader, &snapshot));
             assert!(
                 scheduler
-                    .event_driven_io_from(leader, mm, Update::Observe(vec![key], true))
+                    .event_driven_io_from(leader, mm, Update::Observe(vec![key], true, Vec::new()))
                     .is_none()
             );
             assert!(scheduler.inbound_signals(sibling).is_empty());
@@ -23797,7 +23797,7 @@ mod test {
             assert_eq!(scheduler.host_timed_signals(leader), 0);
             assert!(
                 scheduler
-                    .event_driven_io_from(leader, mm, Update::Observe(vec![key], true))
+                    .event_driven_io_from(leader, mm, Update::Observe(vec![key], true, Vec::new()))
                     .is_none()
             );
             assert!(scheduler.test_sent_signals.as_ref().unwrap().is_empty());

@@ -121,8 +121,8 @@ impl Scheduler {
             return None;
         };
         let dependencies = self.io_dependencies.as_mut()?;
-        if let Update::Observe(keys, first) = update {
-            return dependencies.observe_from(keys, first, Some(observer));
+        if let Update::Observe(keys, first, timerfds) = update {
+            return dependencies.observe_from(keys, first, Some(observer), &timerfds);
         }
         let wake = dependencies.update_from(update, Some(observer));
         self.wake_io_dependencies(wake);
@@ -163,8 +163,8 @@ impl Scheduler {
             }
         }
         let dependencies = self.io_dependencies.as_mut()?;
-        if let Update::Observe(keys, first) = update {
-            return dependencies.observe_attempt(keys, first);
+        if let Update::Observe(keys, first, timerfds) = update {
+            return dependencies.observe_from(keys, first, None, &timerfds);
         }
         let wake = dependencies.update(update);
         self.wake_io_dependencies(wake);
@@ -313,7 +313,7 @@ mod tests {
     ) -> Key {
         scheduler.event_driven_io(Update::Create(key, false));
         let snapshot = scheduler
-            .event_driven_io(Update::Observe(vec![key], true))
+            .event_driven_io(Update::Observe(vec![key], true, Vec::new()))
             .unwrap();
         let mut request = Resources::new(waiter);
         request.insert(ResourceID::InternalIOPolling, Permission::RW);
@@ -702,19 +702,19 @@ mod tests {
         scheduler.thread_tree.add_child(process, worker, false);
         test::register_known_thread_for(&mut scheduler, worker);
         let key = park_dependency(&mut scheduler, waiter, LogicalTime::INDEFINITE);
-        let stale = scheduler.event_driven_io(Update::Observe(vec![key], true)).unwrap();
+        let stale = scheduler.event_driven_io(Update::Observe(vec![key], true, Vec::new())).unwrap();
         grant_exit(&mut scheduler, worker, process, false);
         assert!(scheduler.child_exit_publications_pending.is_empty());
         scheduler.event_driven_io_lifecycle(worker, MmId::initial(process), vec![key]);
         assert!(scheduler.run_queue.contains_tid(waiter));
         assert!(scheduler.are_all_quiesced().is_some());
         assert!(!scheduler.io_dependencies.as_mut().unwrap().register(waiter, &stale));
-        let fresh = scheduler.event_driven_io(Update::Observe(vec![key], true)).unwrap();
+        let fresh = scheduler.event_driven_io(Update::Observe(vec![key], true, Vec::new())).unwrap();
         assert!(scheduler.io_dependencies.as_mut().unwrap().register(waiter, &fresh));
         // A later mutation from the surviving shared-table owner still notifies.
         scheduler.event_driven_io(Update::Change(vec![key]));
         assert!(!scheduler.io_dependencies.as_mut().unwrap().cancel(waiter));
-        assert!(scheduler.event_driven_io(Update::Observe(vec![key], true)).is_some());
+        assert!(scheduler.event_driven_io(Update::Observe(vec![key], true, Vec::new())).is_some());
     }
 
     #[test]
@@ -758,7 +758,7 @@ mod tests {
         assert!(scheduler.complete_child_exit_publication(process));
         assert!(scheduler.step2_drain_prefix().is_ok());
         assert_eq!(unsafe { libc::read(reader.as_raw_fd(), byte.as_mut_ptr().cast(), 1) }, 0);
-        assert!(scheduler.event_driven_io(Update::Observe(vec![epoll], true)).is_some());
+        assert!(scheduler.event_driven_io(Update::Observe(vec![epoll], true, Vec::new())).is_some());
         assert!(!scheduler.io_dependencies.as_mut().unwrap().cancel(waiter));
     }
 
@@ -775,7 +775,7 @@ mod tests {
         // CancelExec runs only after the handler restores old metadata/mm.
         assert!(scheduler.finish_exec_teardown(caller, caller, mm, false).is_empty());
         assert!(scheduler.are_all_quiesced().is_some());
-        let fresh = scheduler.event_driven_io(Update::Observe(vec![key], true)).unwrap();
+        let fresh = scheduler.event_driven_io(Update::Observe(vec![key], true, Vec::new())).unwrap();
         assert!(scheduler.io_dependencies.as_mut().unwrap().register(waiter, &fresh));
         scheduler.next_turns[&caller].req.put(Ok(Resources::new(caller)));
         assert!(scheduler.are_all_quiesced().is_none());
@@ -810,7 +810,7 @@ mod tests {
             let supplied_mm = if gap == 5 { mm.for_exec(caller) } else { mm };
             scheduler.event_driven_io_lifecycle(caller, supplied_mm, vec![key]);
             assert!(scheduler.run_queue.contains_tid(waiter));
-            assert!(scheduler.event_driven_io(Update::Observe(vec![key], true)).is_none());
+            assert!(scheduler.event_driven_io(Update::Observe(vec![key], true, Vec::new())).is_none());
         }
     }
 
@@ -823,7 +823,7 @@ mod tests {
         scheduler.event_driven_io_lifecycle(caller, MmId::initial(caller), vec![key]);
         assert!(scheduler.run_queue.contains_tid(waiter));
         assert!(scheduler.step2_drain_prefix().is_err());
-        assert!(scheduler.event_driven_io(Update::Observe(vec![key], true)).is_some());
+        assert!(scheduler.event_driven_io(Update::Observe(vec![key], true, Vec::new())).is_some());
     }
 
     #[test]
@@ -838,7 +838,7 @@ mod tests {
             scheduler.event_driven_io_lifecycle(caller, MmId::initial(caller), vec![key]);
             assert!(scheduler.run_queue.contains_tid(waiter));
             assert_eq!(scheduler.blocked.timed_waiters.thread_deadline(waiter), None);
-            let fresh = scheduler.event_driven_io(Update::Observe(vec![key], true)).unwrap();
+            let fresh = scheduler.event_driven_io(Update::Observe(vec![key], true, Vec::new())).unwrap();
             assert!(scheduler.io_dependencies.as_mut().unwrap().register(waiter, &fresh));
         }
     }
@@ -853,7 +853,7 @@ mod tests {
         assert!(scheduler.prepare_exec_teardown(caller, caller, mm));
         scheduler.event_driven_io_lifecycle(caller, mm, vec![key]);
         assert!(!scheduler.run_queue.contains_tid(waiter));
-        let fresh = scheduler.event_driven_io(Update::Observe(vec![key], true)).unwrap();
+        let fresh = scheduler.event_driven_io(Update::Observe(vec![key], true, Vec::new())).unwrap();
         assert!(scheduler.io_dependencies.as_mut().unwrap().register(waiter, &fresh));
         scheduler.event_driven_io(Update::Change(vec![key]));
         assert!(scheduler.run_queue.contains_tid(waiter));
@@ -866,7 +866,7 @@ mod tests {
             key, mask: Some(kernel_signal_bit(signal)), create: true,
         });
         let snapshot = scheduler.event_driven_io_from(
-            waiter, mm, Update::Observe(vec![key], true),
+            waiter, mm, Update::Observe(vec![key], true, Vec::new()),
         ).unwrap();
         (key, snapshot)
     }
@@ -877,15 +877,15 @@ mod tests {
         let (key, _) = signalfd_snapshot(&mut scheduler, waiter, libc::SIGUSR1);
         scheduler.exec_incarnations.insert(waiter, MmId::initial(waiter));
         assert!(scheduler.event_driven_io_from(
-            waiter, MmId::initial(other), Update::Observe(vec![key], true),
+            waiter, MmId::initial(other), Update::Observe(vec![key], true, Vec::new()),
         ).is_none());
         let foreign = DetTid::from_raw(999);
         assert!(scheduler.event_driven_io_from(
-            foreign, MmId::initial(foreign), Update::Observe(vec![key], true),
+            foreign, MmId::initial(foreign), Update::Observe(vec![key], true, Vec::new()),
         ).is_none());
         scheduler.thread_tree.thread_to_leader.remove(&waiter);
         assert!(scheduler.event_driven_io_from(
-            waiter, MmId::initial(waiter), Update::Observe(vec![key], true),
+            waiter, MmId::initial(waiter), Update::Observe(vec![key], true, Vec::new()),
         ).is_none());
     }
 
@@ -913,7 +913,7 @@ mod tests {
             assert_eq!(scheduler.blocked.timed_waiters.thread_deadline(waiter), None);
             assert!(!scheduler.io_dependencies.as_mut().unwrap().register(waiter, &snapshot));
             assert!(scheduler.event_driven_io_from(
-                waiter, MmId::initial(waiter), Update::Observe(vec![key], true),
+                waiter, MmId::initial(waiter), Update::Observe(vec![key], true, Vec::new()),
             ).is_none());
             // Graph-only producer exclusions do not alter custody's ledger.
             assert_eq!(scheduler.host_timed_signals(waiter) & kernel_signal_bit(libc::SIGUSR1), 0);
@@ -936,12 +936,12 @@ mod tests {
                 key, mask: Some(kernel_signal_bit(signal)), create: true,
             });
             assert!(scheduler.event_driven_io_from(
-                waiter, mm, Update::Observe(vec![key], true),
+                waiter, mm, Update::Observe(vec![key], true, Vec::new()),
             ).is_none());
             let eventfd = Key::File(OpenFileId::new(waiter, 20));
             scheduler.event_driven_io_from(waiter, mm, Update::Create(eventfd, false));
             assert!(scheduler.event_driven_io_from(
-                waiter, mm, Update::Observe(vec![eventfd], true),
+                waiter, mm, Update::Observe(vec![eventfd], true, Vec::new()),
             ).is_some());
         }
     }

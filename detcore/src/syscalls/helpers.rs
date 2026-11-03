@@ -3493,12 +3493,13 @@ where
         if reconvert {
             maybe_stackguard = None;
         }
-        rsrc.poll_deadline = crate::syscalls::timerfd::publish_before_probe(
+        let publication = crate::syscalls::timerfd::publish_before_probe(
             guest,
             call.into(),
             maybe_timeout.map(|(deadline, _)| deadline),
         )
         .await;
+        rsrc.poll_deadline = publication.deadline;
         if reconvert {
             (call, maybe_stackguard) = call0.into_nonblocking(guest).await;
         }
@@ -3581,7 +3582,7 @@ where
                     Err(error) => break Err(error),
                 }
             } else {
-                crate::event_driven_io::observe(guest, call.into(), rsrc.poll_attempt).await
+                crate::event_driven_io::observe(guest, call.into(), rsrc.poll_attempt, publication.timerfds).await
             };
             observe_dependencies = rsrc.io_dependencies.is_some();
             if rsrc.io_dependencies.is_some() {
@@ -5009,12 +5010,13 @@ where
         if reconvert {
             guard = None;
         }
-        rsrc.poll_deadline = crate::syscalls::timerfd::publish_before_probe(
+        let publication = crate::syscalls::timerfd::publish_before_probe(
             guest,
             call.into(),
             maybe_timeout.map(|(deadline, _)| deadline),
         )
         .await;
+        rsrc.poll_deadline = publication.deadline;
         if reconvert {
             (call, guard) = call0.into_nonblocking(guest).await;
         }
@@ -5029,7 +5031,7 @@ where
         }
         if observe_dependencies {
             rsrc.io_dependencies =
-                crate::event_driven_io::observe(guest, call.into(), rsrc.poll_attempt).await;
+                crate::event_driven_io::observe(guest, call.into(), rsrc.poll_attempt, publication.timerfds).await;
             observe_dependencies = rsrc.io_dependencies.is_some();
             if rsrc.io_dependencies.is_some() {
                 // Unlike a runnable probe, a dependency waiter must be woken

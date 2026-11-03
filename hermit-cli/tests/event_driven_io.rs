@@ -77,16 +77,21 @@ fn guest() -> &'static Path {
     GUEST.as_path()
 }
 
-fn hermit_command(scenario: &str) -> Command {
+fn hermit_command(scenario: &str, event_driven: bool) -> Command {
     let mut command = watchdog();
     command.arg(hermit_test::hermit_binary()).args([
         "--log=info",
         "--backend=ptrace",
         "run",
         "--strict",
-        "--event-driven-io",
         "--base-env=minimal",
     ]);
+    if event_driven {
+        command.arg("--event-driven-io");
+    }
+    if scenario == "timerfd-arm-rearm" {
+        command.arg("--env=HERMIT_TEST_TIMER_DEADLINE=1");
+    }
     if matches!(scenario, "socket-unrelated-producers" | "socket-rights-regular") {
         command.arg("--clock-multiplier=.001");
     } else if matches!(scenario, "socket-route-mutation-fallback"
@@ -191,7 +196,7 @@ fn assert_scenario_output(scenario: &str, expected: Option<&str>) {
         );
     }
 
-    let mut enabled = hermit_command(scenario);
+    let mut enabled = hermit_command(scenario, true);
     enabled.arg("--").arg(binary).arg(scenario);
     let enabled = checked_output(enabled, &format!("enabled {scenario}"));
     assert_eq!(
@@ -202,12 +207,19 @@ fn assert_scenario_output(scenario: &str, expected: Option<&str>) {
     // Every invocation itself compares two complete runs, including their
     // unfiltered INFO envelope and I/O buffers. Independent invocations catch
     // accidental reliance on a previous run's fd identities or subscriptions.
-    for run in 1..=VERIFY_RUNS {
+    // A consumed periodic tick must not reappear even when parking is disabled.
+    let repetitions = if scenario == "timerfd-copyout-faults" {
+        VERIFY_RUNS * 2
+    } else {
+        VERIFY_RUNS
+    };
+    for run in 1..=repetitions {
+        let event_driven = run <= VERIFY_RUNS;
         let verdict = binary
             .parent()
             .unwrap()
             .join(format!("{scenario}-{run}.json"));
-        let mut command = hermit_command(scenario);
+        let mut command = hermit_command(scenario, event_driven);
         command
             .args(["--verify", "--verify-strict"])
             .arg(format!("--verify-json={}", verdict.display()))
@@ -216,7 +228,7 @@ fn assert_scenario_output(scenario: &str, expected: Option<&str>) {
             .arg(scenario);
         let output = checked_output(
             command,
-            &format!("{scenario} strict verification {run}/{VERIFY_RUNS}"),
+            &format!("{scenario} strict verification {run}/{repetitions}, event-driven={event_driven}"),
         );
         assert!(
             String::from_utf8_lossy(&output.stdout).contains(&success),
@@ -322,6 +334,31 @@ fn pipe_missing_opposite_descriptor_keeps_close_fallback() {
 #[test]
 fn pipe_shared_table_bindings_wake_without_last_peer_close() {
     assert_scenario("pipe-shared-bindings");
+}
+
+#[test]
+fn timerfd_arm_rearm_disarm_and_faulted_old_value_wake_aliases() {
+    assert_scenario("timerfd-arm-rearm");
+}
+
+#[test]
+fn timerfd_shared_readers_consume_each_expiration_once() {
+    assert_scenario("timerfd-shared-drain");
+}
+
+#[test]
+fn timerfd_epoll_interests_without_local_descriptors_keep_fallback() {
+    assert_scenario("timerfd-foreign-epoll");
+}
+
+#[test]
+fn timerfd_copyout_faults_preserve_the_actual_consumption_effect() {
+    assert_scenario("timerfd-copyout-faults");
+}
+
+#[test]
+fn timerfd_temporary_signal_masks_interrupt_and_restore() {
+    assert_scenario("timerfd-masked-signal");
 }
 
 #[test]

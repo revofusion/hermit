@@ -185,6 +185,8 @@ mod tests {
         (23, "26ba7da2fa7d5e12", "94273db60f0db69f"),
         // Separates socket authority from immutable Unix connection mutations.
         (24, "90f7bad0100ee8be", "94273db60f0db69f"),
+        // Adds model-owned timerfd sources and per-observation publication OFDs.
+        (25, "5a313c65c6b2661a", "94273db60f0db69f"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that

@@ -1348,7 +1348,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 crate::syscalls::timerfd::publish_expired_in(guest, staged.timerfd_scratch).await;
             let deadline = timing.map(|(_, deadline)| deadline);
             rsrc.poll_deadline =
-                crate::syscalls::timerfd::poll_deadline_with(guest, deadline, next_timerfd);
+                crate::syscalls::timerfd::poll_deadline_with(guest, deadline, next_timerfd.deadline);
             match guest.inject_with_retry(probe).await {
                 Ok(0) => {}
                 Err(errno) if crate::wait_signal_end::is_restart_code(errno) => {}
@@ -1391,11 +1391,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             if in_turn && !masked.observes_deadline_at_entry() {
                 timing = observe_deadline(guest, timeout).await;
-                rsrc.poll_deadline = crate::syscalls::timerfd::poll_deadline_with(
-                    guest,
-                    timing.map(|(_, deadline)| deadline),
-                    next_timerfd,
-                );
+                rsrc.poll_deadline = crate::syscalls::timerfd::poll_deadline_with(guest, timing.map(|(_, deadline)| deadline), next_timerfd.deadline);
             }
             rsrc.poll_attempt += 1;
             if let Some((_, deadline)) = timing
@@ -1605,7 +1601,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             first = false;
             let next_timerfd = crate::syscalls::timerfd::publish_expired(guest).await;
             rsrc.poll_deadline =
-                crate::syscalls::timerfd::poll_deadline_with(guest, deadline, next_timerfd);
+                crate::syscalls::timerfd::poll_deadline_with(guest, deadline, next_timerfd.deadline);
             let result = guest.inject_with_retry(probe).await;
             if !probe.syscall_would_have_blocked(result) {
                 return Ok((result.map_err(Into::into), in_turn));
@@ -1620,7 +1616,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .await
                     .map(|(_, deadline)| deadline);
                 rsrc.poll_deadline =
-                    crate::syscalls::timerfd::poll_deadline_with(guest, deadline, next_timerfd);
+                    crate::syscalls::timerfd::poll_deadline_with(guest, deadline, next_timerfd.deadline);
             }
             rsrc.poll_attempt += 1;
             if let Some(deadline) = deadline

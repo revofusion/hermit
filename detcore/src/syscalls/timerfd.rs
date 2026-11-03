@@ -78,6 +78,7 @@ use crate::syscalls::helpers::poll_deadline_for;
 use crate::tool_global::thread_observe_time;
 use crate::tool_local::Detcore;
 use crate::types::LogicalTime;
+use crate::types::OpenFileId;
 use crate::types::RawFd;
 
 /// How long, in host time, Detcore waits for an expired host timerfd to
@@ -198,7 +199,7 @@ where
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
-    enabled(guest) && !guest.thread_state().virtual_timerfds().is_empty()
+    enabled(guest) && !guest.thread_state().virtual_timerfds().0.is_empty()
 }
 
 /// Before `call` waits in the host, outside Detcore's probes: refuse the run
@@ -387,13 +388,22 @@ where
     guest.thread_state().peek_guest_clock(raw)
 }
 
+/// Fresh publication authority from this process's physical descriptor table.
+/// The identities reuse enumeration's deduplication allocation and are moved
+/// into one observation, never cached across turns or descriptor mutations.
+#[derive(Default)]
+pub(crate) struct Publication {
+    pub(crate) deadline: Option<LogicalTime>,
+    pub(crate) timerfds: Vec<OpenFileId>,
+}
+
 /// Counts every expiration of this process's virtual timerfds at or before the
 /// guest clock, makes each timerfd that gained one readable on the host, and
 /// only then records them. Returns the earliest expiration still ahead, for a
 /// poller's deadline ([`poll_deadline_with`]). A failure refuses the run.
 ///
 /// Call it in the thread's turn, before a probe that `observes_timerfds`.
-pub(crate) async fn publish_expired<T, G>(guest: &mut G) -> Option<LogicalTime>
+pub(crate) async fn publish_expired<T, G>(guest: &mut G) -> Publication
 where
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
@@ -428,6 +438,7 @@ where
         && guest
             .thread_state()
             .virtual_timerfds()
+            .0
             .iter()
             .any(|(_, detfd)| detfd.virtual_timerfd().and_then(|t| t.deadline).is_some())
 }
@@ -453,6 +464,7 @@ where
         && guest
             .thread_state()
             .virtual_timerfds()
+            .0
             .iter()
             .any(|(_, detfd)| detfd.virtual_timerfd().and_then(|t| t.deadline).is_some())
 }
@@ -462,15 +474,20 @@ where
 pub(crate) async fn publish_expired_in<T, G>(
     guest: &mut G,
     scratch: Option<Scratch>,
-) -> Option<LogicalTime>
+) -> Publication
 where
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
-    if !holds_armed_virtual_timerfd(guest) {
-        return None;
+    if !enabled(guest) {
+        return Publication::default();
     }
-    let timerfds = guest.thread_state().virtual_timerfds();
+    let (timerfds, identities) = guest.thread_state().virtual_timerfds();
+    // Disarmed timers still supply publication authority, but do not read the
+    // clock. In particular a process with no timers keeps the no-clock path.
+    if !timerfds.iter().any(|(_, fd)| fd.virtual_timerfd().and_then(|t| t.deadline).is_some()) {
+        return Publication { deadline: None, timerfds: identities };
+    }
     let now = timerfd_now(guest).await;
     let mut next: Option<LogicalTime> = None;
     for (fd, detfd) in timerfds {
@@ -481,6 +498,7 @@ where
         if added > 0 {
             make_readable(guest, fd, scratch).await;
             detfd.set_virtual_timerfd(Some(timer));
+            changed(guest, detfd.open_file_id()).await;
             detlog!(
                 "[dtid {}] timerfd {} expired {} time(s) at virtual time {}, {} unread",
                 guest.thread_state().dettid,
@@ -494,7 +512,7 @@ where
             next = Some(next.map_or(deadline, |earliest| earliest.min(deadline)));
         }
     }
-    next
+    Publication { deadline: next, timerfds: identities }
 }
 
 /// A polling request's deadline: the earlier of the call's own timeout and
@@ -516,22 +534,23 @@ where
     poll_deadline_for(guest, deadline)
 }
 
-/// `publish_expired` before a probe of `call`, if it can observe a timerfd;
-/// returns the poll deadline the probe's request carries.
+/// Publish before the native probe, retaining the freshly enumerated OFDs and
+/// the earlier of the call timeout and next expiration for the scheduler.
 pub(crate) async fn publish_before_probe<T, G>(
     guest: &mut G,
     call: Syscall,
     timeout: Option<LogicalTime>,
-) -> Option<LogicalTime>
+) -> Publication
 where
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
     if !observes_timerfds(guest, call) {
-        return poll_deadline_for(guest, timeout);
+        return Publication { deadline: poll_deadline_for(guest, timeout), timerfds: Vec::new() };
     }
-    let next = publish_expired(guest).await;
-    poll_deadline_with(guest, timeout, next)
+    let mut publication = publish_expired(guest).await;
+    publication.deadline = poll_deadline_with(guest, timeout, publication.deadline);
+    publication
 }
 
 /// The fault the hook asks of this publication, at most once per process.
@@ -696,6 +715,20 @@ where
     }
 }
 
+/// Notify after committing an OFD effect, before any fallible guest copyout.
+async fn changed<T, G>(guest: &mut G, id: OpenFileId)
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    if guest.config().event_driven_io {
+        crate::tool_global::event_driven_io(
+            guest,
+            crate::event_driven_io::Update::Change(vec![crate::event_driven_io::Key::File(id)]),
+        ).await;
+    }
+}
+
 /// `timerfd_settime` on a virtual timerfd, or `None` when Detcore leaves the
 /// call to the host (virtual timerfds off, or `fd` not a timerfd, whose
 /// error the host then reports).
@@ -763,6 +796,7 @@ where
             linux: LinuxTimerfd::set(deadline),
         });
     }
+    changed(guest, detfd.open_file_id()).await;
     detlog!(
         "[dtid {}] timerfd_settime(fd={}, flags={:#x}, interval_ns={}, value_ns={}) armed against virtual clock",
         guest.thread_state().dettid,
@@ -811,11 +845,14 @@ where
     Ok(Some(0))
 }
 
-/// The count a successful read of the virtual timerfd `fd` returns, which the
-/// read consumes: the expirations counted on the virtual clock, instead of
-/// the host's count of Detcore's own arming. `None` when there is nothing to
-/// replace.
-fn take_unread<T, G>(guest: &mut G, fd: RawFd) -> Option<u64>
+/// Reconcile the actual native drain before replacing a successful count.
+/// EFAULT is not itself evidence of a drain: iovec import can fail before
+/// timerfd_read_iter, whereas its copyout can fail after consuming all ticks.
+async fn finish_drain<T, G>(
+    guest: &mut G,
+    fd: RawFd,
+    result: &Result<i64, Error>,
+) -> Option<u64>
 where
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
@@ -828,12 +865,62 @@ where
     if timer.unread == 0 {
         return None;
     }
+    let consumed = match result {
+        Ok(8) => true,
+        // Native ptrace supplies the physical witness independently of the
+        // dependency-parking option; other backends retain their existing path.
+        Err(Error::Errno(Errno::EFAULT))
+            if guest.config().backend == reverie::BackendCapabilities::PTRACE =>
+        {
+            !readable_after_fault(guest, fd).await
+        }
+        _ => false,
+    };
+    if !consumed {
+        return None;
+    }
     let unread = timer.unread;
     timer.unread = 0;
     detfd.set_virtual_timerfd(Some(timer));
     // And Linux's own timer, which its fdinfo shows, as its read leaves it.
     forward_linux_timer(&detfd, |linux| linux.after_read(timer.deadline));
-    Some(unread)
+    changed(guest, detfd.open_file_id()).await;
+    matches!(result, Ok(8)).then_some(unread)
+}
+
+/// The modeled publisher is the only host producer and the caller still owns
+/// its scheduler turn. A zero-time probe therefore distinguishes a fault
+/// before consumption from one after it, without draining or inventing data.
+async fn readable_after_fault<T, G>(guest: &mut G, fd: RawFd) -> bool
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let mut stack = guest.stack().await;
+    let pollfd: AddrMut<libc::pollfd> = stack.reserve();
+    let probe = PollProbe::reserve(&mut stack);
+    let Ok(_guard) = stack.commit() else {
+        refuse(format_args!("no scratch memory to reconcile faulted timerfd {fd} read"));
+    };
+    if let Err(error) = guest.memory().write_value(pollfd, &libc::pollfd {
+        fd, events: libc::POLLIN, revents: 0,
+    }) {
+        refuse(format_args!("could not stage faulted timerfd {fd} read probe: {error}"));
+    }
+    let call = probe.call(guest.memory(), pollfd, 1, 0).unwrap_or_else(|error| {
+        refuse(format_args!("could not prepare faulted timerfd {fd} read probe: {error}"))
+    });
+    inject_bounded(
+        guest, call, Instant::now(), READABLE_VALVE,
+        "reconciling a faulted read of the host timerfd", fd,
+    ).await;
+    let observed = guest.memory().read_value(pollfd).unwrap_or_else(|error| {
+        refuse(format_args!("could not read faulted timerfd {fd} probe: {error}"))
+    });
+    if observed.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+        refuse(format_args!("unexpected readiness after faulted timerfd {fd} read"));
+    }
+    observed.revents & libc::POLLIN != 0
 }
 
 /// Apply `step` to the Linux timer that the fdinfo of the timerfd `detfd`
@@ -855,23 +942,24 @@ fn forward_linux_timer(detfd: &crate::fd::DetFd, step: impl FnOnce(&mut LinuxTim
 }
 
 /// After a `read` of the timerfd `fd` into `buf` returned `result`.
-pub(crate) fn finish_read<T, G>(
+pub(crate) async fn finish_read<T, G>(
     guest: &mut G,
     fd: RawFd,
-    buf: Option<AddrMut<u8>>,
+    buf: Option<AddrMut<'_, u8>>,
     result: Result<i64, Error>,
 ) -> Result<i64, Error>
 where
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
-    if !enabled(guest) || !matches!(result, Ok(8)) {
+    if !enabled(guest) {
         return result;
     }
+    let unread = finish_drain(guest, fd, &result).await;
     let Some(buf) = buf else {
         return result;
     };
-    if let Some(unread) = take_unread(guest, fd) {
+    if let Some(unread) = unread {
         guest.memory().write_value(buf.cast::<u64>(), &unread)?;
     }
     result
@@ -880,10 +968,10 @@ where
 /// After a `readv` of the timerfd `fd` with the `iovcnt` iovecs at `iov`
 /// returned `result`. Linux copies the 8-byte count through the iovecs in
 /// order (`read_iter`), so the virtual count is scattered the same way.
-pub(crate) fn finish_readv<T, G>(
+pub(crate) async fn finish_readv<T, G>(
     guest: &mut G,
     fd: RawFd,
-    iov: Option<syscalls::Addr<libc::iovec>>,
+    iov: Option<syscalls::Addr<'_, u8>>,
     iovcnt: usize,
     result: Result<i64, Error>,
 ) -> Result<i64, Error>
@@ -891,13 +979,13 @@ where
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
-    if !enabled(guest) || !matches!(result, Ok(8)) {
+    if !enabled(guest) {
         return result;
     }
-    let Some(iov) = iov else {
+    let Some(unread) = finish_drain(guest, fd, &result).await else {
         return result;
     };
-    let Some(unread) = take_unread(guest, fd) else {
+    let Some(iov) = iov else {
         return result;
     };
     let bytes = unread.to_ne_bytes();

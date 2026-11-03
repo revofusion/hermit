@@ -7683,7 +7683,7 @@ pub enum SignalScope {
 /// dependency-generation payloads. Other payloads defined elsewhere
 /// (`CommittedSendWindow`, ...) still require a manual revision when their
 /// wire shape changes.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 24;
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 25;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a

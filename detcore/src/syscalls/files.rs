@@ -9169,7 +9169,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // a blocking read's retries publish again at each turn.
                 crate::syscalls::timerfd::publish_expired(guest).await;
                 let result = self.execute_nonblockable_fd_syscall(guest, call).await;
-                crate::syscalls::timerfd::finish_read(guest, call.fd(), call.buf(), result)
+                crate::syscalls::timerfd::finish_read(guest, call.fd(), call.buf(), result).await
             }
             FdType::Eventfd => {
                 trace!(
@@ -10878,7 +10878,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             // virtual count (`crate::syscalls::timerfd`).
             crate::syscalls::timerfd::publish_expired(guest).await;
             let result = self.execute_nonblockable_fd_syscall(guest, call).await;
-            crate::syscalls::timerfd::finish_readv(guest, call.fd(), call.iov(), call.len(), result)
+            crate::syscalls::timerfd::finish_readv(
+                guest, call.fd(), call.iov().map(|iov| iov.cast::<u8>()), call.len(), result,
+            ).await
         } else if physically_nonblocking
             && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd)
         {
@@ -15550,7 +15552,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             })?;
         }
         if internally_nonblocking {
+            guest.thread_state().with_detfd(fd, |detfd| {
+                detfd.set_virtual_timerfd(Some(crate::fd::VirtualTimerfd::default()));
+            })?;
             self.maybe_set_nonblocking_fd(guest, fd);
+            crate::event_driven_io::created(guest, fd, false).await;
         }
         Ok(fd as i64)
     }

@@ -237,7 +237,7 @@ where
         // untracked producers, async IO and fatal signals revoke dependencies.
         // Observe neither registers a waiter nor grants another guest a turn.
         if crate::tool_global::event_driven_io(
-            guest, Update::Observe(vec![Key::Pipe(channel)], false),
+            guest, Update::Observe(vec![Key::Pipe(channel)], false, Vec::new()),
         ).await.is_none() {
             return false;
         }

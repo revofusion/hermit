@@ -2052,7 +2052,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         crate::syscalls::timerfd::publish_expired_in(guest, Some(timerfd_scratch))
                             .await;
                     resources.poll_deadline =
-                        crate::syscalls::timerfd::poll_deadline_with(guest, deadline, next_timerfd);
+                        crate::syscalls::timerfd::poll_deadline_with(guest, deadline, next_timerfd.deadline);
                     // A pending real-time timer expiration that this wait would
                     // be ended by, under the guest's mask or the call's temporary
                     // one (https://github.com/rrnewton/hermit/issues/4089).
@@ -2219,11 +2219,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                             self.write_pselect6_remaining(guest, call, deadline).await?;
                             break Err(errno.into());
                         }
-                        resources.poll_deadline = crate::syscalls::timerfd::poll_deadline_with(
-                            guest,
-                            deadline,
-                            next_timerfd,
-                        );
+                        resources.poll_deadline = crate::syscalls::timerfd::poll_deadline_with(guest, deadline, next_timerfd.deadline);
                     }
                     if let Some(signals) = signals.as_ref() {
                         match signals.interrupted_with_state() {
@@ -2550,7 +2546,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         crate::syscalls::timerfd::publish_expired_in(guest, Some(timerfd_scratch))
                             .await;
                     resources.poll_deadline =
-                        crate::syscalls::timerfd::poll_deadline_with(guest, deadline, next_timerfd);
+                        crate::syscalls::timerfd::poll_deadline_with(guest, deadline, next_timerfd.deadline);
                     // A pending real-time timer expiration that this wait would
                     // be ended by (https://github.com/rrnewton/hermit/issues/4089).
                     let pending = pending_real_time_among(guest, REAL_TIME_SIGNALS).await;
@@ -3360,7 +3356,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             let next_timerfd =
                 crate::syscalls::timerfd::publish_expired_in(guest, timerfd_scratch).await;
             rsrc.poll_deadline =
-                crate::syscalls::timerfd::poll_deadline_with(guest, deadline, next_timerfd);
+                crate::syscalls::timerfd::poll_deadline_with(guest, deadline, next_timerfd.deadline);
             // A pending real-time timer expiration that the temporary mask lets
             // the kernel deliver or discard
             // (https://github.com/rrnewton/hermit/issues/4089).

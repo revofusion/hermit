@@ -3102,6 +3102,42 @@ mod file_metadata_tests {
     }
 
     #[test]
+    fn timerfd_publication_enumeration_is_unique_ordered_and_table_local() {
+        let owner = DetTid::from_raw(9019);
+        let state = ThreadState::new(owner, &Config::default(), ());
+        let first_id = OpenFileId::new(owner, 1);
+        let second_id = OpenFileId::new(owner, 2);
+        let first = DetFd::new(40, OFlag::empty(), FdType::Timerfd, first_id);
+        first.set_virtual_timerfd(Some(crate::fd::VirtualTimerfd::default()));
+        let second = DetFd::new(10, OFlag::empty(), FdType::Timerfd, second_id);
+        second.set_virtual_timerfd(Some(crate::fd::VirtualTimerfd::default()));
+        {
+            let mut metadata = state.metadata();
+            metadata.file_handles.insert(40, first.clone());
+            metadata.file_handles.insert(5, first.clone().with_fd(5));
+            metadata.file_handles.insert(20, first.clone().with_fd(20));
+            metadata.file_handles.insert(10, second);
+            // A physically present but unmodeled timer is not publishable.
+            metadata.file_handles.insert(1, DetFd::new(
+                1, OFlag::empty(), FdType::Timerfd, OpenFileId::new(owner, 3),
+            ));
+        }
+        let (fds, identities) = state.virtual_timerfds();
+        assert_eq!(fds.iter().map(|(fd, _)| *fd).collect::<Vec<_>>(), vec![5, 10]);
+        assert_eq!(identities, vec![first_id, second_id]);
+        state.metadata().file_handles.remove(&5);
+        let (fds, identities) = state.virtual_timerfds();
+        assert_eq!(fds.iter().map(|(fd, _)| *fd).collect::<Vec<_>>(), vec![10, 20]);
+        assert_eq!(identities, vec![second_id, first_id]);
+        state.metadata().file_handles.remove(&20);
+        state.metadata().file_handles.remove(&40);
+        // The model survives here (as it could in another process), but that
+        // cannot supply a physical publication descriptor in this table.
+        assert!(first.virtual_timerfd().is_some());
+        assert_eq!(state.virtual_timerfds().1, vec![second_id]);
+    }
+
+    #[test]
     fn shared_random_promotion_leaves_nonrandom_tables_local() {
         let state = ThreadState::new(DetTid::from_raw(9013), &Config::default(), ());
         let regular = tempfile::tempfile().unwrap();
@@ -7905,8 +7941,9 @@ impl<T> ThreadState<T> {
     /// This process's timerfds that Detcore keeps on virtual time
     /// (`crate::fd::VirtualTimerfd`), one descriptor per open file
     /// description, lowest descriptor number first, so callers visit them in
-    /// a deterministic order.
-    pub(crate) fn virtual_timerfds(&self) -> Vec<(RawFd, DetFd)> {
+    /// a deterministic order. Return the same unique identities used to dedup
+    /// as fresh publication evidence; no second descriptor-table walk is needed.
+    pub(crate) fn virtual_timerfds(&self) -> (Vec<(RawFd, DetFd)>, Vec<OpenFileId>) {
         let mut timerfds: Vec<(RawFd, DetFd)> = self
             .metadata()
             .file_handles
@@ -7918,11 +7955,14 @@ impl<T> ThreadState<T> {
         let mut descriptions = Vec::with_capacity(timerfds.len());
         timerfds.retain(|(_, detfd)| {
             let id = detfd.open_file_id();
-            let first = !descriptions.contains(&id);
-            descriptions.push(id);
-            first
+            if descriptions.contains(&id) {
+                false
+            } else {
+                descriptions.push(id);
+                true
+            }
         });
-        timerfds
+        (timerfds, descriptions)
     }
 
     /// Whether this thread's descriptor table holds a signalfd, as Detcore

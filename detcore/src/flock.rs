@@ -161,7 +161,7 @@ impl Wait {
         first: bool,
     ) -> Result<Box<Snapshot>, Error> {
         let snapshot = if self.domain.enabled() {
-            crate::tool_global::event_driven_io(guest, Update::Observe(vec![self.domain.key], first)).await
+            crate::tool_global::event_driven_io(guest, Update::Observe(vec![self.domain.key], first, Vec::new())).await
         } else {
             None
         };

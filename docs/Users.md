@@ -202,7 +202,7 @@ affected connections. Listeners and unpaired endpoints retain conservative
 mutation dependencies. A connection is promoted only when the existing
 connect/accept custody model proves its peer; ambiguous order, failed dequeue,
 dead pending peers, counter exhaustion or post-accept metadata errors prevent
-promotion. RPC revision 24 distinguishes this dependency protocol from older
+promotion. RPC revision 25 distinguishes this dependency protocol from older
 recordings and binaries.
 
 UDP and Unix datagram descriptors remain unowned. Datagram message APIs,
@@ -213,6 +213,28 @@ authority is already revoked before the preceding ancillary send. A Unix
 connection therefore improves coverage but does not guarantee that every
 PostgreSQL wait can park. Compare polling counts and host-wall intervals
 separately from virtual time; preserve strict repeated-result verification.
+
+Model-owned virtual timerfds also participate in native ptrace dependency
+parking. Each observation carries the fresh OFD identities that its own
+descriptor table can physically publish, including disarmed timers. Every
+timer leaf of a nested epoll graph must have that authority: an inherited
+interest with no local timer descriptor retains fallback even if another
+process holds the timer. Publication reuses the existing timer enumeration and
+deadline queue; no descriptor-visibility cache or separate timer scheduler is
+introduced.
+
+Arm, rearm, disarm, expiration and consumption invalidate affected observations.
+Waiters retry the original native operation at a mutation or virtual deadline;
+readiness and expiration counts are not fabricated. Temporary signal masks,
+private SIGCHLD and lifecycle barriers remain in force. Descriptor transfer,
+foreign timers and unsupported wait forms retain their existing conservative
+behavior.
+
+On native ptrace, faulting timer reads also preserve Linux's consumption
+semantics with or without dependency parking. An invalid iovec can fail before
+consumption, while a buffer copyout can fail after draining the timer. A fresh
+zero-time readability probe distinguishes those cases; a failed witness refuses
+the run. Consumed periodic expirations are not counted again in a later read.
 
 Terminal idle-poller checks first reject stale attempts and runnable, retiring
 or doomed threads using scheduler-owned state. Only a remaining candidate

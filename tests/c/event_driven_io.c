@@ -28,6 +28,8 @@
 #include <sys/sendfile.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
+#include <sys/timerfd.h>
+#include <sys/uio.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -1882,6 +1884,308 @@ static void socketpair_alias(void) {
   puts("socketpair: forked alias data and shutdown wake before child exit");
 }
 
+static void timerfd_set_delay(int fd, time_t seconds, long nanoseconds) {
+  struct itimerspec setting = {
+      .it_value = {.tv_sec = seconds, .tv_nsec = nanoseconds}};
+  CHECK(timerfd_settime(fd, 0, &setting, NULL) == 0);
+}
+
+static void timerfd_pause(void) {
+  struct timespec pause = {.tv_nsec = 20000000};
+  CHECK(nanosleep(&pause, NULL) == 0);
+}
+
+static void timerfd_check_elapsed(struct timespec start) {
+  struct timespec end;
+  CHECK(clock_gettime(CLOCK_MONOTONIC, &end) == 0);
+  int64_t elapsed = (int64_t)(end.tv_sec - start.tv_sec) * 1000000000
+      + end.tv_nsec - start.tv_nsec;
+  CHECK(elapsed >= 0);
+  /* Native dispatch latency is not bounded. Hermit's virtual deadline must
+   * follow the new short setting, not rescue the wait at the old hour. */
+  if (getenv("HERMIT_TEST_TIMER_DEADLINE") != NULL) {
+    CHECK(elapsed < 1000000000);
+  }
+}
+
+static void timerfd_arm_rearm(void) {
+  int fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+  CHECK(fd >= 0);
+  int alias = dup(fd);
+  CHECK(alias >= 0);
+  int inner = epoll_create1(0), outer = epoll_create1(0);
+  CHECK(inner >= 0 && outer >= 0);
+  struct epoll_event interest = {.events = EPOLLIN, .data.u64 = 17};
+  CHECK(epoll_ctl(inner, EPOLL_CTL_ADD, fd, &interest) == 0);
+  interest.data.u64 = 23;
+  CHECK(epoll_ctl(outer, EPOLL_CTL_ADD, inner, &interest) == 0);
+  int ready[2], done[2], release[2];
+  make_pipe(ready);
+  make_pipe(done);
+  make_pipe(release);
+  pid_t child = fork();
+  CHECK(child >= 0);
+  if (child == 0) {
+    CHECK(close(fd) == 0); /* The epoll interest survives through alias. */
+    for (int phase = 0; phase != 4; ++phase) {
+      struct timespec start;
+      CHECK(clock_gettime(CLOCK_MONOTONIC, &start) == 0);
+      put_byte(ready[1], 'r');
+      if (phase % 2 == 0) {
+        struct pollfd item = {.fd = alias, .events = POLLIN};
+        CHECK(poll(&item, 1, -1) == 1 && item.revents == POLLIN);
+      } else {
+        struct epoll_event event;
+        CHECK(epoll_wait(outer, &event, 1, -1) == 1);
+        CHECK(event.events == EPOLLIN && event.data.u64 == 23);
+        CHECK(epoll_wait(inner, &event, 1, 0) == 1);
+        CHECK(event.events == EPOLLIN && event.data.u64 == 17);
+      }
+      CHECK(get_count(alias) == 1);
+      expect_poll(alias, POLLIN, 0);
+      timerfd_check_elapsed(start);
+      put_byte(done[1], 'd');
+    }
+    get_byte(release[0], 'q');
+    _exit(0);
+  }
+  CHECK(close(alias) == 0);
+  for (int phase = 0; phase != 4; ++phase) {
+    get_byte(ready[0], 'r');
+    if (phase != 0) {
+      timerfd_set_delay(fd, 3600, 0);
+    }
+    timerfd_pause();
+    if (phase == 2) {
+      timerfd_set_delay(fd, 0, 0);
+      timerfd_pause();
+    }
+    if (phase == 3) {
+      struct itimerspec setting = {.it_value = {.tv_nsec = 5000000}};
+      errno = 0;
+      CHECK(syscall(SYS_timerfd_settime, fd, 0, &setting, (void*)1) == -1);
+      CHECK(errno == EFAULT); /* Setting takes effect before old-value copyout. */
+    } else {
+      timerfd_set_delay(fd, 0, 5000000);
+    }
+    get_byte(done[0], 'd');
+  }
+  put_byte(release[1], 'q');
+  joined(child);
+  CHECK(close(fd) == 0);
+  CHECK(close(inner) == 0 && close(outer) == 0);
+  puts("timerfd: arm, shorten, disarm and faulted old-value update wake aliases");
+}
+
+struct timerfd_reader_args {
+  int timer;
+  int ready;
+  int done;
+  int release;
+};
+
+static void* timerfd_reader(void* opaque) {
+  struct timerfd_reader_args* args = opaque;
+  put_byte(args->ready, 'r');
+  CHECK(get_count(args->timer) == 1);
+  put_byte(args->done, 'd');
+  get_byte(args->release, 'q');
+  return NULL;
+}
+
+static void timerfd_shared_drain(void) {
+  int fd = timerfd_create(CLOCK_MONOTONIC, 0);
+  CHECK(fd >= 0);
+  int ready[2], done[2], release[2];
+  make_pipe(ready);
+  make_pipe(done);
+  make_pipe(release);
+  struct timerfd_reader_args args = {
+      .timer = fd, .ready = ready[1], .done = done[1], .release = release[0]};
+  pthread_t readers[2];
+  CHECK(pthread_create(&readers[0], NULL, timerfd_reader, &args) == 0);
+  CHECK(pthread_create(&readers[1], NULL, timerfd_reader, &args) == 0);
+  get_byte(ready[0], 'r');
+  get_byte(ready[0], 'r');
+  timerfd_set_delay(fd, 0, 5000000);
+  get_byte(done[0], 'd');
+  expect_poll(done[0], POLLIN, 0); /* One expiration cannot satisfy both reads. */
+  timerfd_set_delay(fd, 0, 5000000);
+  get_byte(done[0], 'd');
+  put_byte(release[1], 'q');
+  put_byte(release[1], 'q');
+  CHECK(pthread_join(readers[0], NULL) == 0);
+  CHECK(pthread_join(readers[1], NULL) == 0);
+  expect_poll(fd, POLLIN, 0);
+  CHECK(close(fd) == 0);
+  puts("timerfd: shared readers consume each expiration once before exit");
+}
+
+static void timerfd_foreign_epoll_case(int add_after_fork) {
+  int epoll = epoll_create1(0);
+  CHECK(epoll >= 0);
+  int fd = -1;
+  struct epoll_event interest = {.events = EPOLLIN, .data.u64 = 29};
+  if (!add_after_fork) {
+    fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+    CHECK(fd >= 0 && epoll_ctl(epoll, EPOLL_CTL_ADD, fd, &interest) == 0);
+  }
+  int ready[2], done[2], release[2];
+  make_pipe(ready);
+  make_pipe(done);
+  make_pipe(release);
+  pid_t child = fork();
+  CHECK(child >= 0);
+  if (child == 0) {
+    if (fd >= 0) {
+      CHECK(close(fd) == 0);
+    }
+    put_byte(ready[1], 'r');
+    struct epoll_event event;
+    CHECK(epoll_wait(epoll, &event, 1, -1) == 1);
+    CHECK(event.events == EPOLLIN && event.data.u64 == 29);
+    put_byte(done[1], 'd');
+    get_byte(release[0], 'q');
+    _exit(0);
+  }
+  get_byte(ready[0], 'r');
+  if (add_after_fork) {
+    fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+    CHECK(fd >= 0 && epoll_ctl(epoll, EPOLL_CTL_ADD, fd, &interest) == 0);
+  }
+  timerfd_set_delay(fd, 0, 5000000);
+  timerfd_pause();
+  /* The waiter has no physical timer descriptor. Its owner explicitly
+   * publishes readiness; the epoll graph alone is not publication authority. */
+  expect_poll(fd, POLLIN, POLLIN);
+  get_byte(done[0], 'd');
+  CHECK(get_count(fd) == 1);
+  put_byte(release[1], 'q');
+  joined(child);
+  CHECK(close(fd) == 0 && close(epoll) == 0);
+}
+
+static void timerfd_foreign_epoll(void) {
+  timerfd_foreign_epoll_case(0);
+  timerfd_foreign_epoll_case(1);
+  puts("timerfd: foreign-held epoll interests wait for owner publication");
+}
+
+static int64_t timerfd_monotonic_ns(void) {
+  struct timespec now;
+  CHECK(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
+  return (int64_t)now.tv_sec * 1000000000 + now.tv_nsec;
+}
+
+static void timerfd_copyout_faults(void) {
+  int fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+  CHECK(fd >= 0);
+  for (int phase = 0; phase != 3; ++phase) {
+    timerfd_set_delay(fd, 0, 5000000);
+    struct pollfd item = {.fd = fd, .events = POLLIN};
+    CHECK(poll(&item, 1, -1) == 1 && item.revents == POLLIN);
+    struct iovec vector = {.iov_base = (void*)1, .iov_len = sizeof(uint64_t)};
+    errno = 0;
+    if (phase == 0) {
+      CHECK(syscall(SYS_read, fd, (void*)1, sizeof(uint64_t)) == -1);
+    } else if (phase == 1) {
+      CHECK(syscall(SYS_readv, fd, (void*)1, 1) == -1);
+    } else {
+      CHECK(syscall(SYS_readv, fd, &vector, 1) == -1);
+    }
+    CHECK(errno == EFAULT);
+    if (phase == 1) {
+      expect_poll(fd, POLLIN, POLLIN); /* Invalid iovec: no timer read occurred. */
+      CHECK(get_count(fd) == 1);
+    } else {
+      expect_poll(fd, POLLIN, 0); /* Copyout failed after consuming the tick. */
+      uint64_t value = 0;
+      errno = 0;
+      CHECK(read(fd, &value, sizeof(value)) == -1 && errno == EAGAIN);
+    }
+  }
+  for (int vectored = 0; vectored != 2; ++vectored) {
+    const int64_t interval = 100000000;
+    struct itimerspec setting = {
+        .it_value = {.tv_nsec = 5000000}, .it_interval = {.tv_nsec = interval}};
+    CHECK(timerfd_settime(fd, 0, &setting, NULL) == 0);
+    struct pollfd item = {.fd = fd, .events = POLLIN};
+    CHECK(poll(&item, 1, -1) == 1 && item.revents == POLLIN);
+    struct iovec vector = {.iov_base = (void*)1, .iov_len = sizeof(uint64_t)};
+    errno = 0;
+    if (vectored) {
+      CHECK(syscall(SYS_readv, fd, &vector, 1) == -1);
+    } else {
+      CHECK(syscall(SYS_read, fd, (void*)1, sizeof(uint64_t)) == -1);
+    }
+    CHECK(errno == EFAULT);
+    /* Do not reset the setting: a stale unread tick would contaminate the
+     * next period. Bracket its deadline and read to tolerate native dispatch
+     * delays without assuming that precisely one host period has elapsed. */
+    struct itimerspec remaining;
+    int64_t before = timerfd_monotonic_ns();
+    CHECK(timerfd_gettime(fd, &remaining) == 0);
+    int64_t after = timerfd_monotonic_ns();
+    CHECK(remaining.it_interval.tv_sec == 0
+        && remaining.it_interval.tv_nsec == interval);
+    CHECK(poll(&item, 1, -1) == 1 && item.revents == POLLIN);
+    int64_t read_before = timerfd_monotonic_ns();
+    uint64_t count = get_count(fd);
+    int64_t read_after = timerfd_monotonic_ns();
+    int64_t until = (int64_t)remaining.it_value.tv_sec * 1000000000
+        + remaining.it_value.tv_nsec;
+    int64_t lower_elapsed = read_before - (after + until);
+    int64_t upper_elapsed = read_after - (before + until);
+    uint64_t minimum = lower_elapsed < 0 ? 0 : lower_elapsed / interval + 1;
+    uint64_t maximum = upper_elapsed < 0 ? 0 : upper_elapsed / interval + 1;
+    CHECK(count > 0 && count >= minimum && count <= maximum);
+  }
+  CHECK(close(fd) == 0);
+  puts("timerfd: read and readv distinguish faults before and after consumption");
+}
+
+static void timerfd_masked_signal(void) {
+  struct sigaction action = {.sa_handler = on_signal};
+  CHECK(sigemptyset(&action.sa_mask) == 0);
+  CHECK(sigaction(SIGUSR1, &action, NULL) == 0);
+  sigset_t blocked, previous, empty, actual;
+  CHECK(sigemptyset(&blocked) == 0 && sigaddset(&blocked, SIGUSR1) == 0);
+  CHECK(sigemptyset(&empty) == 0);
+  CHECK(pthread_sigmask(SIG_BLOCK, &blocked, &previous) == 0);
+  int fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+  CHECK(fd >= 0);
+  int gate[2];
+  make_pipe(gate);
+  pid_t parent = getpid(), child = fork();
+  CHECK(child >= 0);
+  if (child == 0) {
+    get_byte(gate[0], 's');
+    CHECK(kill(parent, SIGUSR1) == 0);
+    get_byte(gate[0], 'a');
+    timerfd_set_delay(fd, 0, 5000000);
+    get_byte(gate[0], 'q');
+    _exit(0);
+  }
+  put_byte(gate[1], 's');
+  struct pollfd item = {.fd = fd, .events = POLLIN};
+  errno = 0;
+  CHECK(ppoll(&item, 1, NULL, &empty) == -1 && errno == EINTR);
+  CHECK(signals_seen == 1);
+  CHECK(pthread_sigmask(SIG_SETMASK, NULL, &actual) == 0);
+  CHECK(sigismember(&actual, SIGUSR1) == 1);
+  put_byte(gate[1], 'a');
+  item.revents = 0;
+  CHECK(ppoll(&item, 1, NULL, &blocked) == 1 && item.revents == POLLIN);
+  CHECK(get_count(fd) == 1);
+  CHECK(pthread_sigmask(SIG_SETMASK, NULL, &actual) == 0);
+  CHECK(sigismember(&actual, SIGUSR1) == 1);
+  put_byte(gate[1], 'q');
+  joined(child);
+  CHECK(pthread_sigmask(SIG_SETMASK, &previous, NULL) == 0);
+  CHECK(close(fd) == 0);
+  puts("timerfd: temporary signal masks interrupt and restore before readiness");
+}
+
 int main(int argc, char** argv) {
   CHECK(argc >= 2);
   if (strcmp(argv[1], "exec-child") == 0) {
@@ -1934,6 +2238,16 @@ int main(int argc, char** argv) {
     pipe_close_lifetime(3, 0);
   } else if (strcmp(argv[1], "pipe-shared-bindings") == 0) {
     pipe_shared_bindings();
+  } else if (strcmp(argv[1], "timerfd-arm-rearm") == 0) {
+    timerfd_arm_rearm();
+  } else if (strcmp(argv[1], "timerfd-shared-drain") == 0) {
+    timerfd_shared_drain();
+  } else if (strcmp(argv[1], "timerfd-foreign-epoll") == 0) {
+    timerfd_foreign_epoll();
+  } else if (strcmp(argv[1], "timerfd-copyout-faults") == 0) {
+    timerfd_copyout_faults();
+  } else if (strcmp(argv[1], "timerfd-masked-signal") == 0) {
+    timerfd_masked_signal();
   } else if (strcmp(argv[1], "poll-timeout") == 0) {
     poll_timeout();
   } else if (strcmp(argv[1], "masked-ppoll-signal-fallback") == 0) {
